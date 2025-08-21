@@ -106,9 +106,28 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         print(f"   Reference-Query setup detected")
         print(f"   Reference ({reference_data}): {(adata_clean.obs['Source'] == reference_data).sum()}")
         print(f"   Query ({query_data}): {(adata_clean.obs['Source'] == query_data).sum()}")
+        
+        # **CRITICAL FIX**: Separate Reference and Query data for training
+        # Train ONLY on Reference samples to keep model unbiased
+        reference_mask = adata_clean.obs['Source'] == reference_data
+        X_train = X[reference_mask]
+        bio_labels_train = bio_labels[reference_mask]
+        batch_labels_train = batch_labels[reference_mask]
+        source_labels_train = source_labels[reference_mask]
+        
+        print(f"   🎯 TRAINING DATA (Reference only):")
+        print(f"      Training samples: {X_train.shape[0]} (Reference only)")
+        print(f"      Training biology labels: {len(np.unique(bio_labels_train))} unique")
+        print(f"      Training batch labels: {len(np.unique(batch_labels_train))} unique")
+        
     else:
         source_labels = None
         print(f"   Standard batch correction (no reference-query split)")
+        # Use all data for training when no reference-query split
+        X_train = X
+        bio_labels_train = bio_labels
+        batch_labels_train = batch_labels
+        source_labels_train = None
     
     # Initialize model
     input_dim = X.shape[1]
@@ -143,11 +162,11 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     batch_criterion = nn.CrossEntropyLoss()
     source_criterion = nn.CrossEntropyLoss() if source_labels is not None else None
     
-    # Convert to tensors
-    X_tensor = torch.FloatTensor(X).to(device)
-    bio_tensor = torch.LongTensor(bio_labels).to(device)
-    batch_tensor = torch.LongTensor(batch_labels).to(device)
-    source_tensor = torch.LongTensor(source_labels).to(device) if source_labels is not None else None
+    # Convert to tensors - Use training data only (Reference samples for reference-query setup)
+    X_tensor = torch.FloatTensor(X_train).to(device)
+    bio_tensor = torch.LongTensor(bio_labels_train).to(device)
+    batch_tensor = torch.LongTensor(batch_labels_train).to(device)
+    source_tensor = torch.LongTensor(source_labels_train).to(device) if source_labels_train is not None else None
     
     # Training
     print(f"🏋️ TRAINING MODEL:")
@@ -155,6 +174,9 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     print(f"   Learning rate: {learning_rate}")
     print(f"   Bio weight: {bio_weight}")
     print(f"   Batch weight: {batch_weight}")
+    if has_source_split:
+        print(f"   🎯 Training ONLY on Reference samples: {X_train.shape[0]} samples")
+        print(f"   📊 Query samples will be processed after training: {X.shape[0] - X_train.shape[0]} samples")
     
     batch_size = 128
     best_bio_acc = 0.0
@@ -166,8 +188,8 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         epoch_bio_weight = bio_weight * (1 + 0.1 * (epoch / epochs))
         epoch_batch_weight = batch_weight * (1 + 0.5 * (epoch / epochs))
         
-        for i in range(0, len(X), batch_size):
-            end_idx = min(i + batch_size, len(X))
+        for i in range(0, len(X_train), batch_size):
+            end_idx = min(i + batch_size, len(X_train))
             
             X_batch = X_tensor[i:end_idx]
             bio_batch = bio_tensor[i:end_idx]
@@ -236,22 +258,27 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
                 torch.nn.utils.clip_grad_norm_(model.source_discriminator.parameters(), max_norm=1.0)
                 source_opt.step()
         
-        # Progress monitoring
+        # Progress monitoring - evaluate on training data (Reference samples only)
         if (epoch + 1) % 100 == 0:
             model.eval()
             with torch.no_grad():
                 if model.source_discriminator is not None:
-                    _, _, bio_pred_all, _, _ = model(X_tensor)
+                    _, _, bio_pred_train, _, _ = model(X_tensor)
                 else:
-                    _, _, bio_pred_all, _ = model(X_tensor)
-                bio_acc = (bio_pred_all.argmax(dim=1) == bio_tensor).float().mean().item()
+                    _, _, bio_pred_train, _ = model(X_tensor)
+                bio_acc = (bio_pred_train.argmax(dim=1) == bio_tensor).float().mean().item()
                 
                 if bio_acc > best_bio_acc:
                     best_bio_acc = bio_acc
                 
-                print(f"   Epoch {epoch+1}/{epochs} - Bio accuracy: {bio_acc:.3f} (best: {best_bio_acc:.3f})")
+                print(f"   Epoch {epoch+1}/{epochs} - Bio accuracy (Reference): {bio_acc:.3f} (best: {best_bio_acc:.3f})")
     
-    print(f"✅ Training completed! Best biology accuracy: {best_bio_acc:.3f}")
+    if has_source_split:
+        print(f"✅ Training completed! Best biology accuracy on Reference: {best_bio_acc:.3f}")
+        print(f"   🎯 Model trained ONLY on {X_train.shape[0]} Reference samples")
+        print(f"   🚀 Now applying to ALL {X.shape[0]} samples (Reference + Query)")
+    else:
+        print(f"✅ Training completed! Best biology accuracy: {best_bio_acc:.3f}")
     
     # Generate corrected embedding
     print("🔄 GENERATING CORRECTED EMBEDDING:")

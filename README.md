@@ -32,12 +32,14 @@ AdverBatchBio is a Python package for performing adversarial batch correction on
    * **Source Discriminator** (optional): Predicts source labels for reference-query alignment.
 
 4. **Adversarial Training Loop**
+   * **Reference-Query Mode**: When `reference_data` and `query_data` are specified, the model trains ONLY on Reference samples to maintain unbiased batch correction. Query samples have no influence on training parameters.
+   * **Standard Mode**: When no reference-query split is specified, trains on all available samples.
    * **Main Loss**: Combines reconstruction loss, biology preservation loss (weighted), and adversarial batch loss (weighted negative).
    * **Discriminator Losses**: Batch and source discriminators are trained to correctly classify batches/sources, while the encoder is trained to fool them.
    * **Gradient Clipping**: Ensures stable training.
 
 5. **Embedding Generation**
-   * After training, the encoder transforms all cells into a batch-corrected latent space.
+   * After training, the encoder transforms all cells (both Reference and Query) into a batch-corrected latent space.
    * The new embedding is stored in `adata_corrected.obsm['X_adversarial']`.
 
 6. **Performance Metrics**
@@ -138,10 +140,10 @@ The function returns three objects:
 If you use AdverBatchBio in your research, please cite:
 
 ```bibtex
-@software{adverbatchbio2024,
+@software{adverbatchbio2025,
   title={AdverBatchBio: Adversarial Batch Correction for Single-Cell and Cell Painting Data},
   author={Shivaprasad Patil},
-  year={2024},
+  year={2025},
   url={https://github.com/shivaprasad-patil}
 }
 ```

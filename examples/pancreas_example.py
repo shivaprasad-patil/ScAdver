@@ -25,12 +25,17 @@ def main():
     
     # Run adversarial batch correction
     print("\nRunning adversarial batch correction...")
+    print("🎯 REFERENCE-QUERY MODE: Training ONLY on Reference samples")
+    print("   Reference samples will be used for model training")
+    print("   Query samples will NOT influence training (unbiased)")
+    print("   Both Reference and Query will be batch-corrected using the trained model")
+    
     adata_corrected, model, metrics = adversarial_batch_correction(
         adata=adata,
         bio_label='celltype',
         batch_label='tech',
-        reference_data='Reference',
-        query_data='Query',
+        reference_data='Reference',  # Model trains ONLY on these samples
+        query_data='Query',          # These samples are corrected but don't influence training
         latent_dim=256,
         epochs=500,
         device='auto'  # Will automatically use MPS on Mac if available
