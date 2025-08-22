@@ -4,14 +4,14 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="adverbatchbio",
+    name="scadver",
     version="1.0.0",
-    author="AdverBatchBio Team",
-    author_email="",
+    author="Shivaprasad Patil",
+    author_email="shivaprasad309319@gmail.com",
     description="Adversarial Batch Correction for Single-Cell Data",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/AdverBatchBio",
+    url="https://github.com/shivaprasad-patil/ScAdver",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
