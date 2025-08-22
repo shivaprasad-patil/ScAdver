@@ -4,12 +4,13 @@ Example usage of AdverBatchBio with pancreas dataset.
 
 import scanpy as sc
 import numpy as np
-from adverbatchbio import adversarial_batch_correction
+from scadver import adversarial_batch_correction
 
 def main():
     # Load pancreas data
     print("Loading pancreas dataset...")
-    adata = sc.read("../pancreas.h5ad")
+    url = "https://figshare.com/ndownloader/files/24539828"
+    adata = sc.read("pancreas.h5ad", backup_url=url)
     
     # Add Source column
     query_mask = np.array([s in ["smartseq2", "celseq2"] for s in adata.obs["tech"]])
