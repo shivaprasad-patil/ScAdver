@@ -1,6 +1,6 @@
-# AdverBatchBio: Adversarial Batch Correction for Single-Cell and Cell Painting Data
+# ScAdver: Adversarial Batch Correction for Single-Cell and Cell Painting Data
 
-AdverBatchBio is a Python package for performing adversarial batch correction on single-cell and cell painting data while preserving biological signal and promoting batch mixing.
+ScAdver is a Python package for performing adversarial batch correction on single-cell and cell painting data while preserving biological signal and promoting batch mixing.
 
 ## Features
 
@@ -12,7 +12,7 @@ AdverBatchBio is a Python package for performing adversarial batch correction on
 
 ## Workflow Steps
 
-![AdverBatchBio Workflow](images/workflow_diagram.png)
+![ScAdver Workflow](images/workflow_diagram.png)
 
 1. **Input Preparation**
    * Takes an AnnData object (adata) with features and metadata.
@@ -51,15 +51,15 @@ AdverBatchBio is a Python package for performing adversarial batch correction on
 
 ### From Source
 ```bash
-git clone https://github.com/yourusername/AdverBatchBio.git
-cd AdverBatchBio
+git clone https://github.com/shivaprasad-patil/ScAdver.git
+cd ScAdver
 pip install .
 ```
 
 ### Development Installation
 ```bash
-git clone https://github.com/yourusername/AdverBatchBio.git
-cd AdverBatchBio
+git clone https://github.com/shivaprasad-patil/ScAdver.git
+cd ScAdver
 pip install -e ".[dev]"
 ```
 
@@ -67,7 +67,7 @@ pip install -e ".[dev]"
 
 ```python
 import scanpy as sc
-from adverbatchbio import adversarial_batch_correction
+from scadver import adversarial_batch_correction
 
 # Load your single-cell data
 adata = sc.read("your_data.h5ad")
@@ -137,11 +137,11 @@ The function returns three objects:
 
 ## Citation
 
-If you use AdverBatchBio in your research, please cite:
+If you use ScAdver in your research, please cite:
 
 ```bibtex
-@software{adverbatchbio2025,
-  title={AdverBatchBio: Adversarial Batch Correction for Single-Cell and Cell Painting Data},
+@software{scadver2025,
+  title={ScAdver: Adversarial Batch Correction for Single-Cell and Cell Painting Data},
   author={Shivaprasad Patil},
   year={2025},
   url={https://github.com/shivaprasad-patil}
