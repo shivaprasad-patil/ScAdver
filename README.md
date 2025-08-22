@@ -16,7 +16,7 @@ ScAdver is a Python package for performing adversarial batch correction on singl
 
 1. **Input Preparation**
    * Takes an AnnData object (adata) with features and metadata.
-   * Requires column names for biological labels (bio_label, e.g., SAMPLEIDDISPLAY_Conc) and batch labels (batch_label, e.g., Batch).
+   * Requires column names for biological labels (bio_label, e.g., Celltype for Single cell or compound for Cell Painting) and batch labels (batch_label, e.g., Batch).
    * Optionally, reference/query source labels for domain adaptation.
 
 2. **Data Filtering & Encoding**
