@@ -14,8 +14,8 @@ def test_imports():
     """Test package imports and metadata"""
     print("🧪 Testing imports...")
     assert scadver.__version__ == "1.0.0"
-    # Allow either ScAdver Team or AdverBatchBio Team (in case of module reload issues)
-    assert scadver.__author__ in ["ScAdver Team", "AdverBatchBio Team"]
+    # Allow previously used team names or the maintainer's name
+    assert scadver.__author__ in ["ScAdver Team", "AdverBatchBio Team", "Shivaprasad Patil"]
     assert "adversarial_batch_correction" in scadver.__all__
     assert "AdversarialBatchCorrector" in scadver.__all__
     print("✅ Imports successful!")
@@ -72,17 +72,17 @@ def test_synthetic_data():
         )
         
         # Check outputs
-        assert 'X_adversarial' in adata_corrected.obsm
+        assert 'X_ScAdver' in adata_corrected.obsm
         assert 'biology_preservation' in metrics
         assert 'batch_correction' in metrics
         assert 'overall_score' in metrics
-        
+
         print(f"✅ Synthetic data test passed!")
         print(f"   Biology preservation: {metrics['biology_preservation']:.3f}")
         print(f"   Batch correction: {metrics['batch_correction']:.3f}")
         print(f"   Overall score: {metrics['overall_score']:.3f}")
         return True
-        
+
     except Exception as e:
         print(f"❌ Synthetic data test failed: {e}")
         return False

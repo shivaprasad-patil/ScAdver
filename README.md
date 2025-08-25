@@ -40,7 +40,7 @@ ScAdver is a Python package for performing adversarial batch correction on singl
 
 5. **Embedding Generation**
    * After training, the encoder transforms all cells (both Reference and Query) into a batch-corrected latent space.
-   * The new embedding is stored in `adata_corrected.obsm['X_adversarial']`.
+      * The new embedding is stored in `adata_corrected.obsm['X_ScAdver']`.
 
 6. **Performance Metrics**
    * Calculates silhouette scores for biology and batch mixing.
@@ -85,10 +85,10 @@ adata_corrected, model, metrics = adversarial_batch_correction(
 )
 
 # Access the corrected embedding
-corrected_embedding = adata_corrected.obsm['X_adversarial']
+corrected_embedding = adata_corrected.obsm['X_ScAdver']
 
 # Compute UMAP on corrected data
-sc.pp.neighbors(adata_corrected, use_rep='X_adversarial')
+sc.pp.neighbors(adata_corrected, use_rep='X_ScAdver')
 sc.tl.umap(adata_corrected)
 
 # Visualize results
@@ -115,7 +115,7 @@ sc.pl.umap(adata_corrected, color=['celltype', 'batch'])
 ## Output
 
 The function returns three objects:
-1. `adata_corrected`: AnnData object with corrected embedding in `obsm['X_adversarial']`
+1. `adata_corrected`: AnnData object with corrected embedding in `obsm['X_ScAdver']`
 2. `model`: Trained AdversarialBatchCorrector model
 3. `metrics`: Dictionary containing performance metrics
 

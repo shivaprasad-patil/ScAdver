@@ -49,7 +49,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     Returns:
     --------
     adata_corrected : AnnData
-        Corrected data with new embedding in obsm['X_adversarial']
+    Corrected data with new embedding in obsm['X_ScAdver']
     corrector : AdversarialBatchCorrector
         Trained model for future use
     metrics : dict
@@ -300,7 +300,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     
     # Create output
     adata_corrected = adata.copy()
-    adata_corrected.obsm['X_adversarial'] = corrected_embedding
+    adata_corrected.obsm['X_ScAdver'] = corrected_embedding
     
     print(f"   Output embedding shape: {corrected_embedding.shape}")
     
@@ -349,6 +349,6 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         model.source_encoder = source_encoder
     
     print("🎉 ADVERSARIAL BATCH CORRECTION COMPLETE!")
-    print(f"   Use: adata_corrected.obsm['X_adversarial']")
+    print(f"   Use: adata_corrected.obsm['X_ScAdver']")
     
     return adata_corrected, model, metrics

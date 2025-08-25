@@ -43,12 +43,12 @@ def main():
     )
     
     print(f"\nBatch correction completed!")
-    print(f"Corrected embedding shape: {adata_corrected.obsm['X_adversarial'].shape}")
+    print(f"Corrected embedding shape: {adata_corrected.obsm['X_ScAdver'].shape}")
     print(f"Performance metrics: {metrics}")
     
     # Compute UMAP on corrected data
     print("\nComputing UMAP...")
-    sc.pp.neighbors(adata_corrected, use_rep='X_adversarial')
+    sc.pp.neighbors(adata_corrected, use_rep='X_ScAdver')
     sc.tl.umap(adata_corrected)
     
     # Visualize results
