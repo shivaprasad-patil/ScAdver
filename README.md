@@ -1,14 +1,19 @@
-# ScAdver: Adversarial Batch Correction for Single-Cell and Cell Painting Data
+# 🧬 ScAdver — Lightweight Adversarial Batch Correction for Single-Cell Data.
 
-ScAdver is a Python package for performing adversarial batch correction on single-cell and cell painting data while preserving biological signal and promoting batch mixing.
+ScAdver is a lightweight Python package for adversarial batch correction in single-cell data 🧪. It offers a compact, well-documented pipeline with core modules:
+scadver.core & scadver.model 📦 — plus an example workflow (pancreas_example.py) and UMAP visualizations so you can reproduce results in minutes ⏱️.
 
-## Features
+💡 Focus: Reference-only training + adversarial learning to remove technical batch effects while preserving biological signal.
 
-- **Adversarial Training**: Uses adversarial neural networks to remove batch effects while preserving biological information
-- **Biology Preservation**: Maintains cell type and biological signal integrity through dedicated classification heads
-- **Batch Mixing**: Promotes integration of different batches using adversarial discrimination
-- **Reference-Query Support**: Handles reference-query integration scenarios
-- **MPS Support**: Optimized for Apple Silicon (M1/M2/M3) with MPS backend support
+## 🔬 Project Workflow
+
+🚀 Key Features
+
+•  🗂 Reference-only training & query mapping — no query data leakage during training.
+•  🛡 Adversarial batch discriminator — reduces batch-specific signals.
+•  🧩 Biology classifier — preserves cell-type structure.
+•  📜 Example scripts & figures — end-to-end reproducibility.
+•  📦 PyPI-style packaging with setup.py & open-source LICENSE.
 
 ## Workflow Steps
 
