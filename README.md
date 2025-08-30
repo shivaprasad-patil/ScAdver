@@ -21,7 +21,7 @@ scadver.core & scadver.model 📦 — plus an example workflow (pancreas_example
 
 1. **Input Preparation**
    * Takes an AnnData object (adata) with features and metadata.
-   * Requires column names for biological labels (bio_label, e.g., Celltype for Single cell or compound for Cell Painting) and batch labels (batch_label, e.g., Batch).
+   * Requires column names for biological labels (bio_label, e.g., Celltype) and batch labels (batch_label, e.g., Batch).
    * Optionally, reference/query source labels for domain adaptation.
 
 2. **Data Filtering & Encoding**
@@ -146,7 +146,7 @@ If you use ScAdver in your research, please cite:
 
 ```bibtex
 @software{scadver2025,
-  title={ScAdver: Adversarial Batch Correction for Single-Cell and Cell Painting Data},
+  title={ScAdver: Adversarial Batch Correction for Single-Cell},
   author={Shivaprasad Patil},
   year={2025},
   url={https://github.com/shivaprasad-patil}
