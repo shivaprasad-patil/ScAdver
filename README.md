@@ -1,4 +1,4 @@
-# 🧬 ScAdver — Lightweight Adversarial Batch Correction for Single-Cell Data.
+# 🧬 ScAdver — Adversarial Batch Correction for Single-Cell Data.
 
 ScAdver is a lightweight Python package for adversarial batch correction in single-cell data 🧪. It offers a compact, well-documented pipeline with core modules:
 scadver.core & scadver.model 📦 — plus an example workflow (pancreas_example.py) and UMAP visualizations so you can reproduce results in minutes ⏱️.
