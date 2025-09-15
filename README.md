@@ -1,6 +1,7 @@
 # 🧬 ScAdver — Adversarial Batch Correction for Single-Cell Data.
 
-ScAdver is a lightweight Python package for adversarial batch correction in single-cell data 🧪. It offers a compact, well-documented pipeline with core modules:
+ScAdver is a lightweight Python package for adversarial batch correction in single-cell data 🧪. 
+It offers a compact, well-documented pipeline with core modules:
 scadver.core & scadver.model 📦 — plus an example workflow (pancreas_example.py) and UMAP visualizations so you can reproduce results in minutes ⏱️.
 
 💡 Focus: Reference-only training + adversarial learning to remove technical batch effects while preserving biological signal.
@@ -10,9 +11,13 @@ scadver.core & scadver.model 📦 — plus an example workflow (pancreas_example
 🚀 Key Features
 
 •  🗂 Reference-only training & query mapping — no query data leakage during training.
+
 •  🛡 Adversarial batch discriminator — reduces batch-specific signals.
+
 •  🧩 Biology classifier — preserves cell-type structure.
+
 •  📜 Example scripts & figures — end-to-end reproducibility.
+
 •  📦 PyPI-style packaging with setup.py & open-source LICENSE.
 
 ## Workflow Steps
