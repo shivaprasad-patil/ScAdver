@@ -16,10 +16,10 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
                                    latent_dim=256, epochs=500, learning_rate=0.001, 
                                    bio_weight=20.0, batch_weight=0.5, device='auto'):
     """
-    Adversarial Batch Correction - Best Performing Method
+    Adversarial Batch Correction
     
     Comprehensive adversarial batch correction with biology preservation and batch mixing.
-    Based on the highest performing V6 implementation from the analysis.
+    
     
     Parameters:
     -----------
