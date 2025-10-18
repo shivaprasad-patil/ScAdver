@@ -14,7 +14,8 @@ from .model import AdversarialBatchCorrector
 
 def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=None, query_data=None, 
                                    latent_dim=256, epochs=500, learning_rate=0.001, 
-                                   bio_weight=20.0, batch_weight=0.5, device='auto'):
+                                   bio_weight=20.0, batch_weight=0.5, device='auto', 
+                                   return_reconstructed=False):
     """
     Adversarial Batch Correction
     
@@ -45,11 +46,17 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         Weight for batch adversarial loss
     device : str, default='auto'
         Device for training ('auto', 'cuda', 'mps', 'cpu')
+    return_reconstructed : bool, default=False
+        If True, returns batch-corrected reconstructed gene expression in adata.layers['ScAdver_reconstructed']
+        If False (default), only returns latent embeddings in adata.obsm['X_ScAdver']
         
     Returns:
     --------
     adata_corrected : AnnData
-    Corrected data with new embedding in obsm['X_ScAdver']
+        Corrected data with:
+        - Low-dimensional embedding in obsm['X_ScAdver'] (n_cells × latent_dim)
+        - Reconstructed gene expression in layers['ScAdver_reconstructed'] (n_cells × n_genes) 
+          [only if return_reconstructed=True]
     corrector : AdversarialBatchCorrector
         Trained model for future use
     metrics : dict
@@ -293,16 +300,25 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     
     with torch.no_grad():
         if model.source_discriminator is not None:
-            corrected_embedding, _, _, _, _ = model(X_full_tensor)
+            corrected_embedding, reconstructed, _, _, _ = model(X_full_tensor)
         else:
-            corrected_embedding, _, _, _ = model(X_full_tensor)
+            corrected_embedding, reconstructed, _, _ = model(X_full_tensor)
         corrected_embedding = corrected_embedding.cpu().numpy()
+        reconstructed = reconstructed.cpu().numpy()
     
     # Create output
     adata_corrected = adata.copy()
     adata_corrected.obsm['X_ScAdver'] = corrected_embedding
     
     print(f"   Output embedding shape: {corrected_embedding.shape}")
+    
+    # Add reconstructed gene expression if requested
+    if return_reconstructed:
+        adata_corrected.layers['ScAdver_reconstructed'] = reconstructed
+        print(f"   Reconstructed expression shape: {reconstructed.shape}")
+        print(f"   ✅ Batch-corrected gene expression saved to adata.layers['ScAdver_reconstructed']")
+    else:
+        print(f"   💡 Tip: Set return_reconstructed=True to get batch-corrected gene expression matrix")
     
     # Calculate metrics
     print("📊 CALCULATING PERFORMANCE METRICS:")
@@ -349,6 +365,8 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         model.source_encoder = source_encoder
     
     print("🎉 ADVERSARIAL BATCH CORRECTION COMPLETE!")
-    print(f"   Use: adata_corrected.obsm['X_ScAdver']")
+    print(f"   Latent embedding: adata_corrected.obsm['X_ScAdver'] (shape: {corrected_embedding.shape})")
+    if return_reconstructed:
+        print(f"   Reconstructed expression: adata_corrected.layers['ScAdver_reconstructed'] (shape: {reconstructed.shape})")
     
     return adata_corrected, model, metrics

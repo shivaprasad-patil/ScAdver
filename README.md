@@ -91,10 +91,11 @@ adata_corrected, model, metrics = adversarial_batch_correction(
     query_data='Query',          # Optional: query data identifier
     latent_dim=256,           # Latent embedding dimension
     epochs=500,               # Number of training epochs
-    device='auto'             # Device: 'auto', 'cuda', 'mps', 'cpu'
+    device='auto',            # Device: 'auto', 'cuda', 'mps', 'cpu'
+    return_reconstructed=False  # Set True to get reconstructed gene expression
 )
 
-# Access the corrected embedding
+# Access the corrected embedding (256-dimensional by default)
 corrected_embedding = adata_corrected.obsm['X_ScAdver']
 
 # Compute UMAP on corrected data
@@ -121,11 +122,55 @@ sc.pl.umap(adata_corrected, color=['celltype', 'batch'])
 - `bio_weight`: Weight for biology preservation loss (default: 20.0)
 - `batch_weight`: Weight for batch adversarial loss (default: 0.5)
 - `device`: Device for training ('auto', 'cuda', 'mps', 'cpu')
+- `return_reconstructed`: Return batch-corrected gene expression (default: False)
 
 ## Output
 
-The function returns three objects:
-1. `adata_corrected`: AnnData object with corrected embedding in `obsm['X_ScAdver']`
+ScAdver provides two types of corrected output:
+
+### 1. Latent Embeddings (Default) 🎯
+**Location**: `adata_corrected.obsm['X_ScAdver']`  
+**Shape**: `(n_cells, latent_dim)` — typically `(n_cells, 256)`  
+**Usage**: Optimized for downstream analysis (UMAP, clustering, visualization)
+
+```python
+# Get 256-dimensional batch-corrected embeddings
+corrected_embedding = adata_corrected.obsm['X_ScAdver']
+
+# Use for UMAP and clustering
+sc.pp.neighbors(adata_corrected, use_rep='X_ScAdver')
+sc.tl.umap(adata_corrected)
+sc.tl.leiden(adata_corrected)
+```
+
+### 2. Reconstructed Gene Expression (Optional) 🧬
+**Location**: `adata_corrected.layers['ScAdver_reconstructed']`  
+**Shape**: `(n_cells, n_genes)` — full feature space  
+**Usage**: Batch-corrected gene expression for differential expression or gene-level analysis
+
+```python
+# Get batch-corrected gene expression matrix
+adata_corrected, model, metrics = adversarial_batch_correction(
+    adata=adata,
+    bio_label='celltype',
+    batch_label='batch',
+    return_reconstructed=True  # ← Enable reconstruction
+)
+
+# Access batch-corrected gene expression
+corrected_expression = adata_corrected.layers['ScAdver_reconstructed']
+
+# Use for differential expression analysis
+adata_corrected.X = corrected_expression  # Replace X if needed
+sc.tl.rank_genes_groups(adata_corrected, groupby='celltype')
+```
+
+### Return Values
+### Return Values
+
+1. `adata_corrected`: AnnData object with:
+   - `obsm['X_ScAdver']`: Batch-corrected latent embeddings (always included)
+   - `layers['ScAdver_reconstructed']`: Batch-corrected gene expression (if `return_reconstructed=True`)
 2. `model`: Trained AdversarialBatchCorrector model
 3. `metrics`: Dictionary containing performance metrics
 

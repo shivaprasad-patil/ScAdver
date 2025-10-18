@@ -48,3 +48,6 @@ Thumbs.db
 .venv
 env/
 venv/
+
+# Local documentation (not for GitHub)
+BLOG_POSTS.md
