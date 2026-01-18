@@ -121,10 +121,9 @@ Once trained, the frozen encoder automatically applies this transformation to ne
 - **[QUICK_SUMMARY.md](QUICK_SUMMARY.md)** - Overview of the mechanism
 - **[ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md)** - Technical details
 - **[RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)** - Advanced: Residual adapter for domain adaptation
-- **[Jupyter Notebook](examples/incremental_query_notebook.ipynb)** - Interactive demo
-- **Examples**:
-  - [incremental_query_example.py](examples/incremental_query_example.py) - Standard projection demo
-  - [adaptive_query_example.py](examples/adaptive_query_example.py) - Adaptive projection demo
+- **Interactive Notebooks**:
+  - [Incremental Query Notebook](examples/incremental_query_notebook.ipynb) - Standard projection demo
+  - [Adaptive Query Notebook](examples/adaptive_query_notebook.ipynb) - Adaptive projection with residual adapters
 - **Visual Diagrams**: `training_phase_diagram.png`, `projection_phase_diagram.png`, `latent_space_diagram.png`
 
 ## Citation
