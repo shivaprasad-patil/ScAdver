@@ -370,3 +370,445 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         print(f"   Reconstructed expression: adata_corrected.layers['ScAdver_reconstructed'] (shape: {reconstructed.shape})")
     
     return adata_corrected, model, metrics
+
+
+def transform_query(model, adata_query, device='auto', return_reconstructed=False):
+    """
+    Project new query data using a pre-trained ScAdver model.
+    
+    This function enables efficient incremental processing of new query batches
+    without retraining. The encoder weights remain frozen, and new data is
+    simply projected through the learned transformation.
+    
+    Key Features:
+    - No Retraining: Encoder/decoder weights are frozen
+    - Batch Correction: Query data is projected into batch-agnostic latent space
+    - Biology Preservation: Cell type and biological signals are maintained
+    - Efficient: Perfect for streaming/incremental data workflows
+    
+    How It Works:
+    The encoder was trained to create a latent representation Z where:
+    1. Biology is preserved (bio_classifier can predict cell types from Z)
+    2. Batch effects are removed (batch_discriminator cannot predict batches from Z)
+    
+    When new query data passes through this frozen encoder:
+    - It automatically gets projected into the same "batch-agnostic, biology-rich" space
+    - No retraining needed - the transformation is fixed and generalizes to new data
+    - Batch effects are corrected because the encoder learned to ignore batch signals
+    - Biology is preserved because the encoder learned to retain biological signals
+    
+    Use Case Example:
+    ```python
+    # Train once on reference data
+    adata_ref_corrected, model, metrics = adversarial_batch_correction(
+        adata=adata_reference,
+        bio_label='celltype',
+        batch_label='tech',
+        epochs=500
+    )
+    
+    # Save model for reuse
+    torch.save(model.state_dict(), 'scadver_model.pt')
+    
+    # Later: Project new query batches (no retraining!)
+    adata_query1_corrected = transform_query(model, adata_query_batch1)
+    adata_query2_corrected = transform_query(model, adata_query_batch2)
+    adata_query3_corrected = transform_query(model, adata_query_batch3)
+    ```
+    
+    Parameters:
+    -----------
+    model : AdversarialBatchCorrector
+        Pre-trained ScAdver model (from adversarial_batch_correction)
+    adata_query : AnnData
+        New query data to project (must have same genes as training data)
+    device : str, default='auto'
+        Device for computation ('auto', 'cuda', 'mps', 'cpu')
+    return_reconstructed : bool, default=False
+        If True, also return batch-corrected reconstructed gene expression
+        in adata.layers['ScAdver_reconstructed']
+        
+    Returns:
+    --------
+    adata_corrected : AnnData
+        Query data with:
+        - Batch-corrected latent embedding in obsm['X_ScAdver']
+        - Batch-corrected reconstructed expression in layers['ScAdver_reconstructed']
+          [only if return_reconstructed=True]
+    
+    Notes:
+    ------
+    - Query data must have the same number of genes (features) as training data
+    - Encoder/decoder remain frozen - no training occurs
+    - Very fast - just a forward pass through the network
+    - Batch effects are automatically corrected via the learned transformation
+    """
+    
+    print("🚀 TRANSFORMING QUERY DATA (No Retraining)")
+    print("="*50)
+    
+    # Set device
+    if device == 'auto':
+        if torch.backends.mps.is_available():
+            device = torch.device('mps')
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+    else:
+        device = torch.device(device)
+    
+    print(f"   Device: {device}")
+    print(f"   Query samples: {adata_query.shape[0]}")
+    print(f"   Query features: {adata_query.shape[1]}")
+    
+    # Move model to device and set to evaluation mode
+    model = model.to(device)
+    model.eval()
+    
+    # Prepare query data
+    X_query = adata_query.X.copy()
+    if hasattr(X_query, 'toarray'):
+        X_query = X_query.toarray()
+    X_query = X_query.astype(np.float32)
+    X_query_tensor = torch.FloatTensor(X_query).to(device)
+    
+    print("🔄 Projecting through frozen encoder...")
+    print("   ✅ Encoder weights: FROZEN (no training)")
+    print("   ✅ Batch correction: Active (via learned transformation)")
+    print("   ✅ Biology preservation: Active (via learned transformation)")
+    
+    # Forward pass through frozen model (no gradients needed)
+    with torch.no_grad():
+        if model.source_discriminator is not None:
+            corrected_embedding, reconstructed, _, _, _ = model(X_query_tensor)
+        else:
+            corrected_embedding, reconstructed, _, _ = model(X_query_tensor)
+        
+        corrected_embedding = corrected_embedding.cpu().numpy()
+        reconstructed = reconstructed.cpu().numpy()
+    
+    # Create output
+    adata_corrected = adata_query.copy()
+    adata_corrected.obsm['X_ScAdver'] = corrected_embedding
+    
+    print(f"✅ Transformation complete!")
+    print(f"   Output embedding shape: {corrected_embedding.shape}")
+    
+    if return_reconstructed:
+        adata_corrected.layers['ScAdver_reconstructed'] = reconstructed
+        print(f"   Reconstructed expression shape: {reconstructed.shape}")
+        print(f"   💾 Saved to adata.layers['ScAdver_reconstructed']")
+    
+    print("\n📊 How Batch Correction Works Without Retraining:")
+    print("   1. Encoder learned transformation: X (genes) → Z (latent)")
+    print("   2. During training, Z was optimized to:")
+    print("      • Preserve biology (bio_classifier succeeds)")
+    print("      • Remove batch effects (batch_discriminator fails)")
+    print("   3. This transformation is now FIXED in the encoder weights")
+    print("   4. New query data passes through same transformation")
+    print("   5. Result: Batch-corrected, biology-preserved embeddings!")
+    
+    return adata_corrected
+
+
+def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label=None,
+                            adapter_dim=128, adaptation_epochs=50, learning_rate=0.001,
+                            device='auto', return_reconstructed=False):
+    """
+    Advanced query projection with residual domain adaptation.
+    
+    This function adapts the pre-trained encoder to query data using a lightweight
+    residual adapter, enabling better handling of domain shift while keeping the
+    reference encoder frozen.
+    
+    Key Differences from transform_query():
+    - Handles larger domain shifts between reference and query
+    - Adapts to query-specific patterns
+    - Optional biological supervision on query data
+
+    When to Use This:
+    1. Large protocol/technology differences (e.g., 10X → Smart-seq2)
+    2. Query has unique characteristics not seen in reference
+    3. Biological labels available on query data
+    
+    How It Works:
+    ```
+    Reference: E(x_ref) → z_ref (unchanged)
+    Query:     E(x_query) → z → z' = z + R(z)
+    
+    Where R is a small residual adapter trained to:
+    1. Align query to reference space (adversarial domain loss)
+    2. Preserve biological structure (supervised or unsupervised)
+    ```
+    
+    Parameters:
+    -----------
+    model : AdversarialBatchCorrector
+        Pre-trained ScAdver model
+    adata_query : AnnData
+        Query data to adapt and project
+    adata_reference : AnnData, optional
+        Reference data for domain alignment (subset sufficient)
+        If None, uses unsupervised adaptation
+    bio_label : str, optional
+        Biological label column for supervised adaptation
+        Enables biology-preserving loss on query data
+    adapter_dim : int, default=128
+        Hidden dimension of residual adapter
+    adaptation_epochs : int, default=50
+        Number of adaptation training epochs
+    learning_rate : float, default=0.001
+        Learning rate for adapter and discriminator
+    device : str, default='auto'
+        Device for computation
+    return_reconstructed : bool, default=False
+        Return batch-corrected gene expression
+        
+    Returns:
+    --------
+    adata_corrected : AnnData
+        Adapted query data with batch-corrected embeddings
+        
+    Example:
+    --------
+    >>> # Fast path (standard)
+    >>> adata_q = transform_query(model, adata_query)
+    >>> 
+    >>> # Adaptive path (advanced)
+    >>> adata_q = transform_query_adaptive(
+    ...     model, 
+    ...     adata_query,
+    ...     adata_reference=adata_ref[:500],  # Small reference sample
+    ...     bio_label='celltype',
+    ...     adaptation_epochs=50
+    ... )
+    """
+    
+    from .model import ResidualAdapter, DomainDiscriminator
+    
+    print("🔬 ADAPTIVE QUERY PROJECTION (Domain Adaptation)")
+    print("="*50)
+    
+    # Set device
+    if device == 'auto':
+        if torch.backends.mps.is_available():
+            device = torch.device('mps')
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+    else:
+        device = torch.device(device)
+    
+    print(f"   Device: {device}")
+    print(f"   Query samples: {adata_query.shape[0]}")
+    print(f"   Adapter dimension: {adapter_dim}")
+    print(f"   Adaptation epochs: {adaptation_epochs}")
+    
+    # Prepare query data
+    X_query = adata_query.X.copy()
+    if hasattr(X_query, 'toarray'):
+        X_query = X_query.toarray()
+    X_query = X_query.astype(np.float32)
+    X_query_tensor = torch.FloatTensor(X_query).to(device)
+    
+    # Move model to device and freeze it
+    model = model.to(device)
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Get latent dimension
+    with torch.no_grad():
+        z_sample = model.encoder(X_query_tensor[:10])
+        latent_dim = z_sample.shape[1]
+    
+    # Initialize adapter and domain discriminator
+    adapter = ResidualAdapter(latent_dim, adapter_dim).to(device)
+    domain_disc = DomainDiscriminator(latent_dim).to(device)
+    
+    # Optimizers
+    optimizer_adapter = optim.Adam(adapter.parameters(), lr=learning_rate)
+    optimizer_disc = optim.Adam(domain_disc.parameters(), lr=learning_rate)
+    
+    # Prepare reference data if provided
+    if adata_reference is not None:
+        X_ref = adata_reference.X.copy()
+        if hasattr(X_ref, 'toarray'):
+            X_ref = X_ref.toarray()
+        X_ref = X_ref.astype(np.float32)
+        X_ref_tensor = torch.FloatTensor(X_ref).to(device)
+        print(f"   Reference samples for alignment: {X_ref.shape[0]}")
+    else:
+        X_ref_tensor = None
+        print("   ⚠️  No reference data: Using unsupervised adaptation")
+    
+    # Prepare biological labels if provided
+    bio_loss_fn = None
+    if bio_label is not None and bio_label in adata_query.obs.columns:
+        bio_encoder = LabelEncoder()
+        bio_labels = bio_encoder.fit_transform(adata_query.obs[bio_label])
+        bio_labels_tensor = torch.LongTensor(bio_labels).to(device)
+        bio_loss_fn = nn.CrossEntropyLoss()
+        print(f"   Biological supervision: {bio_label} ({len(bio_encoder.classes_)} classes)")
+    else:
+        bio_labels_tensor = None
+        print("   ⚠️  No biological labels: Using unsupervised adaptation")
+    
+    # Training loop
+    print(f"\n🏋️  Training residual adapter...")
+    print("   Strategy: Adversarial domain alignment + biological preservation")
+    
+    batch_size = 128
+    best_alignment = float('inf')
+    best_adapter_state = None
+    
+    for epoch in range(adaptation_epochs):
+        adapter.train()
+        domain_disc.train()
+        
+        # Create batches
+        n_samples = X_query_tensor.shape[0]
+        indices = torch.randperm(n_samples)
+        
+        epoch_disc_loss = 0
+        epoch_adapter_loss = 0
+        n_batches = 0
+        
+        for i in range(0, n_samples, batch_size):
+            batch_idx = indices[i:i+batch_size]
+            X_batch = X_query_tensor[batch_idx]
+            
+            # ====== Train Domain Discriminator ======
+            optimizer_disc.zero_grad()
+            
+            with torch.no_grad():
+                # Get query embeddings
+                z_query = model.encoder(X_batch)
+                z_query_adapted = adapter(z_query)
+                
+                # Get reference embeddings if available
+                if X_ref_tensor is not None:
+                    ref_idx = torch.randint(0, X_ref_tensor.shape[0], (len(batch_idx),))
+                    X_ref_batch = X_ref_tensor[ref_idx]
+                    z_ref = model.encoder(X_ref_batch)
+                else:
+                    z_ref = None
+            
+            if z_ref is not None:
+                # Discriminator loss: distinguish reference (0) vs adapted query (1)
+                domain_pred_ref = domain_disc(z_ref)
+                domain_pred_query = domain_disc(z_query_adapted)
+                
+                domain_labels_ref = torch.zeros(len(z_ref), dtype=torch.long, device=device)
+                domain_labels_query = torch.ones(len(z_query_adapted), dtype=torch.long, device=device)
+                
+                loss_disc = nn.CrossEntropyLoss()(domain_pred_ref, domain_labels_ref) + \
+                           nn.CrossEntropyLoss()(domain_pred_query, domain_labels_query)
+                
+                loss_disc.backward()
+                optimizer_disc.step()
+                epoch_disc_loss += loss_disc.item()
+            
+            # ====== Train Adapter ======
+            optimizer_adapter.zero_grad()
+            
+            # Get embeddings
+            with torch.no_grad():
+                z_query = model.encoder(X_batch)
+            z_query_adapted = adapter(z_query)
+            
+            # Loss 1: Adversarial (fool discriminator)
+            if z_ref is not None:
+                domain_pred = domain_disc(z_query_adapted)
+                # Want discriminator to think query is reference (label=0)
+                domain_labels_fake_ref = torch.zeros(len(z_query_adapted), dtype=torch.long, device=device)
+                loss_adversarial = nn.CrossEntropyLoss()(domain_pred, domain_labels_fake_ref)
+            else:
+                loss_adversarial = torch.tensor(0.0, device=device)
+            
+            # Loss 2: Biological preservation (if labels available)
+            if bio_labels_tensor is not None:
+                bio_batch_labels = bio_labels_tensor[batch_idx]
+                bio_pred = model.bio_classifier(z_query_adapted)
+                loss_bio = bio_loss_fn(bio_pred, bio_batch_labels)
+            else:
+                loss_bio = torch.tensor(0.0, device=device)
+            
+            # Loss 3: Reconstruction (preserve information)
+            with torch.no_grad():
+                recon_orig = model.decoder(z_query)
+            recon_adapted = model.decoder(z_query_adapted)
+            loss_recon = nn.MSELoss()(recon_adapted, recon_orig)
+            
+            # Combined loss
+            loss_adapter = loss_adversarial + 5.0 * loss_bio + 0.1 * loss_recon
+            
+            loss_adapter.backward()
+            optimizer_adapter.step()
+            
+            epoch_adapter_loss += loss_adapter.item()
+            n_batches += 1
+        
+        # Logging
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            avg_disc_loss = epoch_disc_loss / max(n_batches, 1)
+            avg_adapter_loss = epoch_adapter_loss / n_batches
+            print(f"   Epoch {epoch+1}/{adaptation_epochs} - "
+                  f"Disc: {avg_disc_loss:.4f}, Adapter: {avg_adapter_loss:.4f}")
+            
+            if avg_adapter_loss < best_alignment:
+                best_alignment = avg_adapter_loss
+                # Save best adapter parameters
+                best_adapter_state = {k: v.cpu().clone() for k, v in adapter.state_dict().items()}
+                print(f"      💾 New best adapter saved!")
+    
+    # Restore best adapter parameters
+    if best_adapter_state is not None:
+        adapter.load_state_dict({k: v.to(device) for k, v in best_adapter_state.items()})
+        print(f"✅ Adaptation complete! Best alignment loss: {best_alignment:.4f}")
+        print(f"   🔄 Restored adapter parameters from best epoch")
+    else:
+        print(f"✅ Adaptation complete! Best alignment loss: {best_alignment:.4f}")
+    
+    # ====== Generate Adapted Embeddings ======
+    print("\n🔄 Generating adapted embeddings...")
+    adapter.eval()
+    
+    with torch.no_grad():
+        # Process in batches
+        adapted_embeddings = []
+        reconstructed = [] if return_reconstructed else None
+        
+        for i in range(0, len(X_query_tensor), batch_size):
+            X_batch = X_query_tensor[i:i+batch_size]
+            z_batch = model.encoder(X_batch)
+            z_adapted_batch = adapter(z_batch)
+            adapted_embeddings.append(z_adapted_batch.cpu().numpy())
+            
+            if return_reconstructed:
+                recon_batch = model.decoder(z_adapted_batch)
+                reconstructed.append(recon_batch.cpu().numpy())
+        
+        adapted_embeddings = np.vstack(adapted_embeddings)
+        if return_reconstructed:
+            reconstructed = np.vstack(reconstructed)
+    
+    # Create output AnnData
+    adata_corrected = adata_query.copy()
+    adata_corrected.obsm['X_ScAdver'] = adapted_embeddings
+    
+    if return_reconstructed:
+        adata_corrected.layers['ScAdver_reconstructed'] = reconstructed
+        print(f"   ✅ Adapted embedding: {adapted_embeddings.shape}")
+        print(f"   ✅ Reconstructed expression: {reconstructed.shape}")
+    else:
+        print(f"   ✅ Adapted embedding: {adapted_embeddings.shape}")
+    
+    print("\n🎉 ADAPTIVE PROJECTION COMPLETE!")
+    print(f"   Output: adata.obsm['X_ScAdver'] (adapted embeddings)")
+    if return_reconstructed:
+        print(f"   Output: adata.layers['ScAdver_reconstructed'] (batch-corrected expression)")
+    
+    return adata_corrected

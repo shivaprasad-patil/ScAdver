@@ -106,3 +106,63 @@ class AdversarialBatchCorrector(nn.Module):
             return encoded, decoded, bio_pred, batch_pred, source_pred
         else:
             return encoded, decoded, bio_pred, batch_pred
+
+
+class ResidualAdapter(nn.Module):
+    """
+    Lightweight residual adapter for domain adaptation.
+    
+    Adds a small residual correction to frozen encoder outputs:
+        z' = z + R(z)
+    
+    This allows adapting to new query domains without modifying
+    the reference encoder or disturbing reference embeddings.
+    """
+    
+    def __init__(self, latent_dim, adapter_dim=128, dropout=0.1):
+        super().__init__()
+        
+        self.adapter = nn.Sequential(
+            nn.Linear(latent_dim, adapter_dim),
+            nn.LayerNorm(adapter_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(adapter_dim, latent_dim),
+            nn.Tanh()  # Bounded residual
+        )
+        
+        # Initialize to near-zero residual (identity initially)
+        self.adapter[-2].weight.data.mul_(0.01)
+        self.adapter[-2].bias.data.zero_()
+    
+    def forward(self, z):
+        """Add residual correction to latent embedding"""
+        return z + self.adapter(z)
+
+
+class DomainDiscriminator(nn.Module):
+    """
+    Domain discriminator for adversarial domain adaptation.
+    
+    Distinguishes reference vs query embeddings to guide
+    the residual adapter training.
+    """
+    
+    def __init__(self, latent_dim, hidden_dim=256, dropout=0.3):
+        super().__init__()
+        
+        self.discriminator = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 2)  # Binary: reference vs query
+        )
+    
+    def forward(self, z):
+        """Predict domain (0=reference, 1=query)"""
+        return self.discriminator(z)

@@ -1,194 +1,131 @@
-# 🧬 ScAdver — Adversarial Batch Correction for Single-Cell Data.
+# 🧬 ScAdver — Adversarial Batch Correction for Single-Cell Data
 
-ScAdver is a lightweight Python package for adversarial batch correction in single-cell data 🧪. 
-It offers a compact, well-documented pipeline with core modules:
-scadver.core & scadver.model 📦 — plus an example workflow (pancreas_example.py) and UMAP visualizations so you can reproduce results in minutes ⏱️.
+Adversarial batch correction for single-cell RNA-seq data that preserves biology while removing batch effects.
 
-💡 Focus: Reference-only training + adversarial learning to remove technical batch effects while preserving biological signal.
+## Key Features
 
-## 🔬 Project Workflow
-
-🚀 Key Features
-
-•  🗂 Reference-only training & query mapping — no query data leakage during training.
-
-•  🛡 Adversarial batch discriminator — reduces batch-specific signals.
-
-•  🧩 Biology classifier — preserves cell-type structure.
-
-•  📜 Example scripts & figures — end-to-end reproducibility.
-
-•  📦 PyPI-style packaging with setup.py & open-source LICENSE.
-
-## Workflow Steps
-
-![ScAdver Workflow](images/workflow_diagram.png)
-
-1. **Input Preparation**
-   * Takes an AnnData object (adata) with features and metadata.
-   * Requires column names for biological labels (bio_label, e.g., Celltype) and batch labels (batch_label, e.g., Batch).
-   * Optionally, reference/query source labels for domain adaptation.
-
-2. **Data Filtering & Encoding**
-   * Filters out cells with missing biological labels.
-   * Encodes biological and batch labels as integers for neural network training.
-   * Optionally encodes source labels for reference-query setup.
-
-3. **Model Architecture**
-   * **Encoder**: Deep feedforward network maps input features to a latent space.
-   * **Decoder**: Reconstructs input from latent space (for signal preservation).
-   * **Biology Classifier**: Predicts biological labels from latent space (to preserve biology).
-   * **Batch Discriminator**: Predicts batch labels from latent space (to remove batch effects).
-   * **Source Discriminator** (optional): Predicts source labels for reference-query alignment.
-
-4. **Adversarial Training Loop**
-   * **Reference-Query Mode**: When `reference_data` and `query_data` are specified, the model trains ONLY on Reference samples to maintain unbiased batch correction. Query samples have no influence on training parameters.
-   * **Standard Mode**: When no reference-query split is specified, trains on all available samples.
-   * **Main Loss**: Combines reconstruction loss, biology preservation loss (weighted), and adversarial batch loss (weighted negative).
-   * **Discriminator Losses**: Batch and source discriminators are trained to correctly classify batches/sources, while the encoder is trained to fool them.
-   * **Gradient Clipping**: Ensures stable training.
-
-5. **Embedding Generation**
-   * After training, the encoder transforms all cells (both Reference and Query) into a batch-corrected latent space.
-      * The new embedding is stored in `adata_corrected.obsm['X_ScAdver']`.
-
-6. **Performance Metrics**
-   * Calculates silhouette scores for biology and batch mixing.
-   * Returns batch correction score, biology preservation score, and overall score.
-   * If reference-query is used, also returns source integration score.
+- ✅ **Train once, project forever**: Save trained model and process unlimited query batches
+- ⚡ **Fast inference**: < 1 second per query batch (no retraining)
+- 🎯 **Biology preserved**: Cell types and biological variation maintained
+- 🔄 **Batch-free**: Technical variation and protocol effects removed
+- 🖥️ **Multi-device**: Supports CPU, CUDA, and Apple Silicon (MPS)
 
 ## Installation
 
-### From Source
 ```bash
-git clone https://github.com/shivaprasad-patil/ScAdver.git
-cd ScAdver
-pip install .
-```
-
-### Development Installation
-```bash
-git clone https://github.com/shivaprasad-patil/ScAdver.git
-cd ScAdver
-pip install -e ".[dev]"
+pip install git+https://github.com/shivaprasad-patil/ScAdver.git
 ```
 
 ## Quick Start
+
+### Basic Usage
 
 ```python
 import scanpy as sc
 from scadver import adversarial_batch_correction
 
-# Load your single-cell data
+# Load data
 adata = sc.read("your_data.h5ad")
 
-# Run adversarial batch correction
-adata_corrected, model, metrics = adversarial_batch_correction(
-    adata=adata,
-    bio_label='celltype',     # Column name for biological labels
-    batch_label='batch',      # Column name for batch labels
-    reference_data='Reference',  # Optional: reference data identifier
-    query_data='Query',          # Optional: query data identifier
-    latent_dim=256,           # Latent embedding dimension
-    epochs=500,               # Number of training epochs
-    device='auto',            # Device: 'auto', 'cuda', 'mps', 'cpu'
-    return_reconstructed=False  # Set True to get reconstructed gene expression
-)
-
-# Access the corrected embedding (256-dimensional by default)
-corrected_embedding = adata_corrected.obsm['X_ScAdver']
-
-# Compute UMAP on corrected data
-sc.pp.neighbors(adata_corrected, use_rep='X_ScAdver')
-sc.tl.umap(adata_corrected)
-
-# Visualize results
-sc.pl.umap(adata_corrected, color=['celltype', 'batch'])
-```
-
-## Parameters
-
-### Required Parameters
-- `adata`: AnnData object containing single-cell data
-- `bio_label`: Column name for biological labels to preserve (e.g., 'celltype')
-- `batch_label`: Column name for batch labels to correct (e.g., 'batch')
-
-### Optional Parameters
-- `reference_data`: Value identifying reference data in 'Source' column
-- `query_data`: Value identifying query data in 'Source' column
-- `latent_dim`: Dimensionality of latent embedding (default: 256)
-- `epochs`: Number of training epochs (default: 500)
-- `learning_rate`: Learning rate for optimizers (default: 0.001)
-- `bio_weight`: Weight for biology preservation loss (default: 20.0)
-- `batch_weight`: Weight for batch adversarial loss (default: 0.5)
-- `device`: Device for training ('auto', 'cuda', 'mps', 'cpu')
-- `return_reconstructed`: Return batch-corrected gene expression (default: False)
-
-## Output
-
-ScAdver provides two types of corrected output:
-
-### 1. Latent Embeddings (Default) 🎯
-**Location**: `adata_corrected.obsm['X_ScAdver']`  
-**Shape**: `(n_cells, latent_dim)` — typically `(n_cells, 256)`  
-**Usage**: Optimized for downstream analysis (UMAP, clustering, visualization)
-
-```python
-# Get 256-dimensional batch-corrected embeddings
-corrected_embedding = adata_corrected.obsm['X_ScAdver']
-
-# Use for UMAP and clustering
-sc.pp.neighbors(adata_corrected, use_rep='X_ScAdver')
-sc.tl.umap(adata_corrected)
-sc.tl.leiden(adata_corrected)
-```
-
-### 2. Reconstructed Gene Expression (Optional) 🧬
-**Location**: `adata_corrected.layers['ScAdver_reconstructed']`  
-**Shape**: `(n_cells, n_genes)` — full feature space  
-**Usage**: Batch-corrected gene expression for differential expression or gene-level analysis
-
-```python
-# Get batch-corrected gene expression matrix
+# Run batch correction
 adata_corrected, model, metrics = adversarial_batch_correction(
     adata=adata,
     bio_label='celltype',
     batch_label='batch',
-    return_reconstructed=True  # ← Enable reconstruction
+    epochs=500
 )
 
-# Access batch-corrected gene expression
-corrected_expression = adata_corrected.layers['ScAdver_reconstructed']
-
-# Use for differential expression analysis
-adata_corrected.X = corrected_expression  # Replace X if needed
-sc.tl.rank_genes_groups(adata_corrected, groupby='celltype')
+# Visualize
+sc.pp.neighbors(adata_corrected, use_rep='X_ScAdver')
+sc.tl.umap(adata_corrected)
+sc.pl.umap(adata_corrected, color=['celltype', 'batch'])
 ```
 
-### Return Values
-### Return Values
+### Incremental Query Processing
 
-1. `adata_corrected`: AnnData object with:
-   - `obsm['X_ScAdver']`: Batch-corrected latent embeddings (always included)
-   - `layers['ScAdver_reconstructed']`: Batch-corrected gene expression (if `return_reconstructed=True`)
-2. `model`: Trained AdversarialBatchCorrector model
-3. `metrics`: Dictionary containing performance metrics
+Train once on reference, then project unlimited query batches without retraining:
 
-### Metrics
-- `biology_preservation`: Biology preservation score (higher is better)
-- `batch_correction`: Batch correction score (higher is better)
-- `overall_score`: Overall performance score
-- `source_integration`: Source integration score (if reference-query setup)
+```python
+import torch
+from scadver import adversarial_batch_correction, transform_query
 
-## Requirements
+# Step 1: Train on reference (once)
+adata_ref_corrected, model, metrics = adversarial_batch_correction(
+    adata=adata_reference,
+    bio_label='celltype',
+    batch_label='tech',
+    epochs=500
+)
 
-- Python >= 3.8
-- PyTorch >= 1.12.0 (with MPS support for Apple Silicon)
-- NumPy >= 1.20.0
-- pandas >= 1.3.0
-- scikit-learn >= 1.0.0
-- scanpy >= 1.8.0
-- anndata >= 0.8.0
+# Step 2: Save model
+torch.save(model.state_dict(), 'scadver_model.pt')
+
+# Step 3: Project query batches (< 1 second each)
+adata_query1 = transform_query(model, adata_query_batch1)
+adata_query2 = transform_query(model, adata_query_batch2)
+# ... unlimited batches
+
+# Step 4: Combine and analyze
+adata_all = sc.concat([adata_ref_corrected, adata_query1, adata_query2])
+sc.pp.neighbors(adata_all, use_rep='X_ScAdver')
+sc.tl.umap(adata_all)
+```
+
+**Benefits**: 1000x faster than retraining • Consistent embeddings • Scalable to unlimited queries
+
+### Advanced: Adaptive Query Processing 🔬
+
+For large domain shifts (e.g., different protocols/technologies), use adaptive projection with residual adapters:
+
+```python
+from scadver import transform_query_adaptive
+
+# When query domain differs significantly from reference
+adata_query_adapted = transform_query_adaptive(
+    model=model,
+    adata_query=adata_query,
+    adata_reference=adata_reference[:500],  # Small reference sample
+    bio_label='celltype',  # Optional: enables supervised adaptation
+    adapter_dim=128,
+    adaptation_epochs=50
+)
+```
+
+**Key Differences**:
+- ✅ Better handles domain shift (e.g., 10X → Smart-seq2)
+- ✅ Adapts to query-specific patterns via residual adapter
+- ✅ Optional biological supervision for improved alignment
+- ⚠️ Slower: ~1-2 minutes (trains small adapter network)
+- ⚠️ Best for: Heterogeneous protocols, diverse tissue types
+
+**When to use**: Large technology differences • Query-specific adaptations needed • Quality > Speed
+
+**When to use standard `transform_query()`**: Similar protocols • Speed critical • Many batches
+
+## How It Works
+
+The encoder learns to:
+- ✅ Keep biological patterns (via bio-classifier)
+- ❌ Remove batch patterns (via adversarial discriminator)
+
+Once trained, the frozen encoder automatically applies this transformation to new data—no retraining needed.
+
+## Output
+
+- **Latent embeddings**: `adata.obsm['X_ScAdver']` (256-dimensional, batch-corrected)
+- **Reconstructed expression**: `adata.layers['ScAdver_reconstructed']` (optional, use `return_reconstructed=True`)
+- **Metrics**: Biology preservation, batch correction, overall score
+
+## Documentation
+
+- **[QUICK_SUMMARY.md](QUICK_SUMMARY.md)** - Overview of the mechanism
+- **[ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md)** - Technical details
+- **[RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)** - Advanced: Residual adapter for domain adaptation
+- **[Jupyter Notebook](examples/incremental_query_notebook.ipynb)** - Interactive demo
+- **Examples**:
+  - [incremental_query_example.py](examples/incremental_query_example.py) - Standard projection demo
+  - [adaptive_query_example.py](examples/adaptive_query_example.py) - Adaptive projection demo
+- **Visual Diagrams**: `training_phase_diagram.png`, `projection_phase_diagram.png`, `latent_space_diagram.png`
 
 ## Citation
 
