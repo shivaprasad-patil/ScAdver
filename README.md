@@ -2,6 +2,8 @@
 
 Adversarial batch correction for single-cell RNA-seq data that preserves biology while removing batch effects.
 
+![ScAdver Workflow](images/workflow_diagram.png)
+
 ## Key Features
 
 - ✅ **Train once, project forever**: Save trained model and process unlimited query batches
