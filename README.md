@@ -73,7 +73,7 @@ sc.pp.neighbors(adata_all, use_rep='X_ScAdver')
 sc.tl.umap(adata_all)
 ```
 
-**Benefits**: 1000x faster than retraining • Consistent embeddings • Scalable to unlimited queries
+**Benefits**: Faster than retraining • Consistent embeddings • Scalable to unlimited queries
 
 ### Advanced: Adaptive Query Processing 🔬
 
@@ -97,7 +97,7 @@ adata_query_adapted = transform_query_adaptive(
 - ✅ Better handles domain shift (e.g., 10X → Smart-seq2)
 - ✅ Adapts to query-specific patterns via residual adapter
 - ✅ Optional biological supervision for improved alignment
-- ⚠️ Slower: ~1-2 minutes (trains small adapter network)
+- ⚠️ Slower: trains small adapter network
 - ⚠️ Best for: Heterogeneous protocols, diverse tissue types
 
 **When to use**: Large technology differences • Query-specific adaptations needed • Quality > Speed
