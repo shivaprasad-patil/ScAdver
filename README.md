@@ -2,7 +2,7 @@
 
 Adversarial batch correction for single-cell RNA-seq data that preserves biology while removing batch effects.
 
-![ScAdver Workflow](images/workflow_diagram.png)
+![ScAdver Workflow](images/ScAdver_workflow.png)
 
 ## Key Features
 
