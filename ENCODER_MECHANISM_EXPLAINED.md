@@ -449,10 +449,11 @@ adata_ref_corrected, model, metrics = adversarial_batch_correction(
 
 ### Projection Phase
 ```python
-# NO training happens here!
-adata_query_corrected = transform_query(
+# NO training happens here (fast mode, adapter_dim=0)!
+adata_query_corrected = transform_query_adaptive(
     model=model,  # Frozen weights
     adata_query=adata_query
+    # adapter_dim=0 by default - direct projection
 )
 
 # What happened:
@@ -462,6 +463,13 @@ adata_query_corrected = transform_query(
 # 4. Batch effects automatically removed
 # 5. Biology automatically preserved
 # 6. Output: Z_query in same latent space as Z_ref
+
+# For large domain shifts, use adapter_dim>0:
+# adata_query_adapted = transform_query_adaptive(
+#     model, adata_query, 
+#     adata_reference=adata_ref[:500],
+#     adapter_dim=128  # Enables residual adapter training
+# )
 ```
 
 ### Result
@@ -565,59 +573,3 @@ Total parameters breakdown:
 > regardless of batch effects.
 
 ---
-
-## 🎓 Analogies for Intuition
-
-### 1. Language Translation
-```
-Training: Learn English → French translation rules
-Reference: "Hello" → "Bonjour", "Goodbye" → "Au revoir"
-
-Query: Use learned rules on new sentences
-"Hello friend" → "Bonjour ami" (no retraining needed!)
-
-Same with ScAdver:
-Training: Learn gene_expression → batch_free_embedding rules
-Query: Apply same rules to new cells (no retraining needed!)
-```
-
-### 2. Photo Filter
-```
-Training: Learn how to enhance faces, remove backgrounds
-Reference: Train on 10,000 photos
-
-Query: Apply filter to new photos
-New photo → [Same filter] → Enhanced face, clean background
-
-Same with ScAdver:
-Training: Learn to enhance biology, remove batch
-Query: Apply same transformation to new cells
-```
-
-### 3. Noise-Canceling Headphones
-```
-Training: Learn what "noise" sounds like vs "speech"
-Reference: Listen to speech in various noisy environments
-
-Query: Cancel noise in NEW noisy environment
-New noise → [Same algorithm] → Clean speech
-
-Same with ScAdver:
-Training: Learn what "batch" looks like vs "biology"  
-Query: Remove batch in NEW batch environment
-```
-
----
-
-## 📖 References
-
-This mechanism is inspired by:
-- Domain Adversarial Neural Networks (DANN)
-- Adversarial Autoencoders
-- Batch effect correction methods (Harmony, Seurat)
-
-But ScAdver combines them specifically for single-cell data with:
-- Biology preservation objective
-- Batch removal objective
-- Reconstruction objective
-- All in one unified framework

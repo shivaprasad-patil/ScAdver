@@ -201,11 +201,9 @@ Once trained, the frozen encoder automatically applies this transformation to ne
 
 ## Documentation
 
-- **[QUICK_SUMMARY.md](QUICK_SUMMARY.md)** - Overview of the mechanism
-- **[ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md)** - Technical details
-- **[RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)** - Residual adapter for domain adaptation
-- **Interactive Notebooks**:
-  - [Query Projection Notebook](examples/query_projection_notebook.ipynb) - Fast vs adaptive query projection comparison
+- **[ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md)** - How the encoder training and projection works
+- **[RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)** - Residual adapters for domain adaptation
+- **[Query Projection Notebook](examples/query_projection_notebook.ipynb)** - Fast vs adaptive comparison
 
 ## Citation
 

@@ -2,19 +2,18 @@
 
 ## Overview
 
-ScAdver now supports **two query projection strategies**:
+ScAdver uses a **unified query projection function** with two modes controlled by `adapter_dim`:
 
-### 1. Standard Projection (`transform_query()`) - DEFAULT
-- **Speed**: < 1 second
-- **Approach**: Zero-shot projection through frozen encoder
-- **Best for**: Similar domains, speed-critical applications
-- **Assumption**: Query domain similar to reference
+### Fast Mode (`adapter_dim=0`, default)
+- **Approach**: Direct projection through frozen encoder
+- **Best for**: Similar protocols, speed-critical applications
+- **Output**: `z = encoder(x)`
 
-### 2. Adaptive Projection (`transform_query_adaptive()`) - ADVANCED
-- **Speed**: 1-2 minutes
+### Adaptive Mode (`adapter_dim>0`)
 - **Approach**: Trains lightweight residual adapter
-- **Best for**: Large domain shifts, quality-critical applications
-- **Advantage**: Handles protocol/technology differences
+- **Best for**: Large domain shifts (e.g., 10X → Smart-seq2)
+- **Output**: `z' = encoder(x) + adapter(encoder(x))`
+- **Key insight**: Adapter learns to be ≈0 when domains are similar
 
 ---
 
@@ -72,51 +71,24 @@ By keeping the encoder `E` frozen and only training `R`:
 
 ---
 
-## When to Use Each Method
+## When to Use Each Mode
 
-| Scenario | Method | Why |
-|----------|--------|-----|
-| **10X v2 → 10X v3** | Standard | Protocols are similar |
-| **10X → Smart-seq2** | Adaptive | Large technology difference |
-| **Same lab, batch 1 → batch 2** | Standard | Technical replicates |
-| **Human → Mouse (transfer learning)** | Adaptive | Cross-species adaptation |
-| **Processing 1000s of batches** | Standard | Speed matters |
-| **Single critical query** | Adaptive | Quality matters |
-| **Streaming/real-time** | Standard | Sub-second inference |
-| **Offline analysis** | Either | Both acceptable |
-
----
-
-## Performance Comparison
-
-### Speed
-```
-Standard:  0.1-1 second
-Adaptive:  60-120 seconds (50 epochs)
-```
-
-### Quality Improvement (Domain Shift Scenarios)
-
-| Metric | Standard | Adaptive | Improvement |
-|--------|----------|----------|-------------|
-| **Silhouette (batch)** | 0.45 | 0.72 | +60% |
-| **Silhouette (bio)** | 0.78 | 0.82 | +5% |
-| **Domain alignment** | 0.65 | 0.88 | +35% |
-
-*Note: Improvements largest when domain shift is significant*
-
----
+| Scenario | adapter_dim | Why |
+|----------|-------------|-----|
+| **10X v2 → 10X v3** | 0 (default) | Similar protocols |
+| **10X → Smart-seq2** | 128 | Large technology shift |
+| **Same lab, different batches** | 0 | Technical replicates |
+| **Cross-species transfer** | 128-256 | Domain adaptation needed |
+| **Processing many batches** | 0 | Speed critical |
+| **Streaming/real-time** | 0 | Fast inference |
+| **Quality-critical analysis** | 128 | Better alignment |
 
 ## Usage Example
 
 ```python
-from scadver import (
-    adversarial_batch_correction,
-    transform_query,           # Fast
-    transform_query_adaptive   # Adaptive
-)
+from scadver import adversarial_batch_correction, transform_query_adaptive
 
-# Train once
+# Train once on reference
 adata_ref, model, metrics = adversarial_batch_correction(
     adata=adata_reference,
     bio_label='celltype',
@@ -124,17 +96,18 @@ adata_ref, model, metrics = adversarial_batch_correction(
     epochs=500
 )
 
-# ===== Scenario 1: Similar protocols =====
-adata_query1 = transform_query(model, query_batch1)  # <1 sec
-adata_query2 = transform_query(model, query_batch2)  # <1 sec
+# Fast mode (adapter_dim=0, default) - Similar protocols
+adata_query1 = transform_query_adaptive(model, query_batch1)
+adata_query2 = transform_query_adaptive(model, query_batch2)
 
-# ===== Scenario 2: Different protocol =====
+# Adaptive mode (adapter_dim>0) - Large domain shift
 adata_query_smartseq = transform_query_adaptive(
     model=model,
     adata_query=smartseq_batch,
-    adata_reference=adata_reference[:500],  # Reference sample
-    bio_label='celltype',                    # Optional
-    adaptation_epochs=50                     # ~1 min
+    adata_reference=adata_reference[:500],  # Small reference sample
+    bio_label='celltype',                    # Optional supervision
+    adapter_dim=128,                         # Enable residual adapter
+    adaptation_epochs=50
 )
 ```
 
@@ -221,27 +194,11 @@ learning_rate = 0.001      # Learning rate
 
 ## Limitations
 
-1. **Speed**: 100-1000x slower than standard projection
-2. **Requires reference sample**: Need small reference subset for alignment
-3. **Per-query training**: Each new domain needs adapter training
-4. **Hyperparameters**: May need tuning for specific domains
+1. **Computational cost**: Adaptive mode (adapter_dim>0) requires training, while fast mode is direct projection
+2. **Requires reference sample**: Adaptive mode needs small reference subset for alignment
+3. **Per-query training**: Each new domain with large shift needs separate adapter training
+4. **Hyperparameters**: May need tuning for optimal performance
+
+**Key Innovation**: The unified approach is self-adaptive—when adapter_dim>0 but domains are similar, the adapter automatically learns to output ≈0, making it equivalent to fast mode. This robustness eliminates the need to manually choose between methods.
 
 ---
-
-## Related Work
-
-This approach is inspired by:
-- **Domain-Adversarial Neural Networks** (Ganin et al., 2016)
-- **Adapter Modules** (Houlsby et al., 2019)
-- **LoRA** (Hu et al., 2021)
-- **Batch correction methods**: Harmony, Seurat integration
-
-Key innovation: Combines adversarial domain adaptation with frozen encoder preservation for single-cell batch correction.
-
----
-
-## See Also
-
-- [QUICK_SUMMARY.md](../QUICK_SUMMARY.md) - Overview of standard projection
-- [examples/adaptive_query_example.py](adaptive_query_example.py) - Full demo
-- [examples/incremental_query_notebook.ipynb](incremental_query_notebook.ipynb) - Interactive comparison
