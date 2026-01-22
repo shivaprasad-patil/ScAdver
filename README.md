@@ -171,7 +171,6 @@ adata_query4 = transform_query_adaptive(
 **✅ Use when:**
 - Query batches arrive over time (streaming data)
 - Want to reuse the same model for many queries
-- Speed is critical (< 1 second per query)
 - Deploying model as a service
 
 **Example**: See [examples/query_projection_notebook.ipynb](examples/query_projection_notebook.ipynb)
