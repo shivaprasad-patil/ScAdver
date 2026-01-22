@@ -7,7 +7,7 @@ ScAdver performs adversarial batch correction for single-cell RNA-seq data, elim
 ## Key Features
 
 - ✅ **Train once, project forever**: Save trained model and process unlimited query batches
-- ⚡ **Fast inference**: No retrainin required
+- ⚡ **Fast inference**: No retraining required
 - 🎯 **Biology preserved**: Cell types and biological variation maintained
 - 🔄 **Batch-free**: Technical variation and protocol effects removed
 - 🖥️ **Multi-device**: Supports CPU, CUDA, and Apple Silicon (MPS)
@@ -192,7 +192,7 @@ The encoder learns to:
 - ✅ Keep biological patterns (via bio-classifier)
 - ❌ Remove batch patterns (via adversarial discriminator)
 
-Once trained, the frozen encoder automatically applies this transformation to new data—no retraining needed.
+Once trained, the frozen encoder automatically applies this transformation to new data—no ining needed.
 
 ## Output
 
