@@ -372,167 +372,32 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     return adata_corrected, model, metrics
 
 
-def transform_query(model, adata_query, device='auto', return_reconstructed=False):
-    """
-    Project new query data using a pre-trained ScAdver model.
-    
-    This function enables efficient incremental processing of new query batches
-    without retraining. The encoder weights remain frozen, and new data is
-    simply projected through the learned transformation.
-    
-    Key Features:
-    - No Retraining: Encoder/decoder weights are frozen
-    - Batch Correction: Query data is projected into batch-agnostic latent space
-    - Biology Preservation: Cell type and biological signals are maintained
-    - Efficient: Perfect for streaming/incremental data workflows
-    
-    How It Works:
-    The encoder was trained to create a latent representation Z where:
-    1. Biology is preserved (bio_classifier can predict cell types from Z)
-    2. Batch effects are removed (batch_discriminator cannot predict batches from Z)
-    
-    When new query data passes through this frozen encoder:
-    - It automatically gets projected into the same "batch-agnostic, biology-rich" space
-    - No retraining needed - the transformation is fixed and generalizes to new data
-    - Batch effects are corrected because the encoder learned to ignore batch signals
-    - Biology is preserved because the encoder learned to retain biological signals
-    
-    Use Case Example:
-    ```python
-    # Train once on reference data
-    adata_ref_corrected, model, metrics = adversarial_batch_correction(
-        adata=adata_reference,
-        bio_label='celltype',
-        batch_label='tech',
-        epochs=500
-    )
-    
-    # Save model for reuse
-    torch.save(model.state_dict(), 'scadver_model.pt')
-    
-    # Later: Project new query batches (no retraining!)
-    adata_query1_corrected = transform_query(model, adata_query_batch1)
-    adata_query2_corrected = transform_query(model, adata_query_batch2)
-    adata_query3_corrected = transform_query(model, adata_query_batch3)
-    ```
-    
-    Parameters:
-    -----------
-    model : AdversarialBatchCorrector
-        Pre-trained ScAdver model (from adversarial_batch_correction)
-    adata_query : AnnData
-        New query data to project (must have same genes as training data)
-    device : str, default='auto'
-        Device for computation ('auto', 'cuda', 'mps', 'cpu')
-    return_reconstructed : bool, default=False
-        If True, also return batch-corrected reconstructed gene expression
-        in adata.layers['ScAdver_reconstructed']
-        
-    Returns:
-    --------
-    adata_corrected : AnnData
-        Query data with:
-        - Batch-corrected latent embedding in obsm['X_ScAdver']
-        - Batch-corrected reconstructed expression in layers['ScAdver_reconstructed']
-          [only if return_reconstructed=True]
-    
-    Notes:
-    ------
-    - Query data must have the same number of genes (features) as training data
-    - Encoder/decoder remain frozen - no training occurs
-    - Very fast - just a forward pass through the network
-    - Batch effects are automatically corrected via the learned transformation
-    """
-    
-    print("🚀 TRANSFORMING QUERY DATA (No Retraining)")
-    print("="*50)
-    
-    # Set device
-    if device == 'auto':
-        if torch.backends.mps.is_available():
-            device = torch.device('mps')
-        elif torch.cuda.is_available():
-            device = torch.device('cuda')
-        else:
-            device = torch.device('cpu')
-    else:
-        device = torch.device(device)
-    
-    print(f"   Device: {device}")
-    print(f"   Query samples: {adata_query.shape[0]}")
-    print(f"   Query features: {adata_query.shape[1]}")
-    
-    # Move model to device and set to evaluation mode
-    model = model.to(device)
-    model.eval()
-    
-    # Prepare query data
-    X_query = adata_query.X.copy()
-    if hasattr(X_query, 'toarray'):
-        X_query = X_query.toarray()
-    X_query = X_query.astype(np.float32)
-    X_query_tensor = torch.FloatTensor(X_query).to(device)
-    
-    print("🔄 Projecting through frozen encoder...")
-    print("   ✅ Encoder weights: FROZEN (no training)")
-    print("   ✅ Batch correction: Active (via learned transformation)")
-    print("   ✅ Biology preservation: Active (via learned transformation)")
-    
-    # Forward pass through frozen model (no gradients needed)
-    with torch.no_grad():
-        if model.source_discriminator is not None:
-            corrected_embedding, reconstructed, _, _, _ = model(X_query_tensor)
-        else:
-            corrected_embedding, reconstructed, _, _ = model(X_query_tensor)
-        
-        corrected_embedding = corrected_embedding.cpu().numpy()
-        reconstructed = reconstructed.cpu().numpy()
-    
-    # Create output
-    adata_corrected = adata_query.copy()
-    adata_corrected.obsm['X_ScAdver'] = corrected_embedding
-    
-    print(f"✅ Transformation complete!")
-    print(f"   Output embedding shape: {corrected_embedding.shape}")
-    
-    if return_reconstructed:
-        adata_corrected.layers['ScAdver_reconstructed'] = reconstructed
-        print(f"   Reconstructed expression shape: {reconstructed.shape}")
-        print(f"   💾 Saved to adata.layers['ScAdver_reconstructed']")
-    
-    print("\n📊 How Batch Correction Works Without Retraining:")
-    print("   1. Encoder learned transformation: X (genes) → Z (latent)")
-    print("   2. During training, Z was optimized to:")
-    print("      • Preserve biology (bio_classifier succeeds)")
-    print("      • Remove batch effects (batch_discriminator fails)")
-    print("   3. This transformation is now FIXED in the encoder weights")
-    print("   4. New query data passes through same transformation")
-    print("   5. Result: Batch-corrected, biology-preserved embeddings!")
-    
-    return adata_corrected
-
-
 def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label=None,
-                            adapter_dim=128, adaptation_epochs=50, learning_rate=0.001,
+                            adapter_dim=0, adaptation_epochs=50, learning_rate=0.001,
                             device='auto', return_reconstructed=False):
     """
-    Advanced query projection with residual domain adaptation.
+    Unified query projection with optional residual domain adaptation.
     
-    This function adapts the pre-trained encoder to query data using a lightweight
-    residual adapter, enabling better handling of domain shift while keeping the
-    reference encoder frozen.
+    This function projects query data using the pre-trained encoder. By default (adapter_dim=0),
+    it performs fast, direct projection. When adapter_dim > 0, it trains a lightweight residual
+    adapter for handling domain shifts.
     
-    Key Differences from transform_query():
-    - Handles larger domain shifts between reference and query
-    - Adapts to query-specific patterns
-    - Optional biological supervision on query data
+    **Unified Behavior:**
+    - adapter_dim=0 (default): Fast direct projection, no adaptation (< 1 second)
+    - adapter_dim>0: Adaptive projection with residual adapter (handles domain shifts)
+    
+    When adapter_dim=0, the residual adapter is effectively zero, so:
+    ```
+    output = encoder(x) + 0 = encoder(x)
+    ```
+    This makes it identical to standard incremental query processing.
 
-    When to Use This:
+    When to Use Adaptation (adapter_dim > 0):
     1. Large protocol/technology differences (e.g., 10X → Smart-seq2)
     2. Query has unique characteristics not seen in reference
     3. Biological labels available on query data
     
-    How It Works:
+    How Residual Adaptation Works:
     ```
     Reference: E(x_ref) → z_ref (unchanged)
     Query:     E(x_query) → z → z' = z + R(z)
@@ -540,6 +405,7 @@ def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label
     Where R is a small residual adapter trained to:
     1. Align query to reference space (adversarial domain loss)
     2. Preserve biological structure (supervised or unsupervised)
+    3. If adapter learns R(z) ≈ 0, automatically reduces to standard projection
     ```
     
     Parameters:
@@ -547,19 +413,21 @@ def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label
     model : AdversarialBatchCorrector
         Pre-trained ScAdver model
     adata_query : AnnData
-        Query data to adapt and project
+        Query data to project
     adata_reference : AnnData, optional
-        Reference data for domain alignment (subset sufficient)
-        If None, uses unsupervised adaptation
+        Reference data for domain alignment (required if adapter_dim > 0)
+        Small subset sufficient (e.g., 500 cells)
     bio_label : str, optional
         Biological label column for supervised adaptation
         Enables biology-preserving loss on query data
-    adapter_dim : int, default=128
+    adapter_dim : int, default=0
         Hidden dimension of residual adapter
+        - 0: Fast direct projection (no adaptation)
+        - >0: Adaptive projection with domain adaptation
     adaptation_epochs : int, default=50
-        Number of adaptation training epochs
+        Number of adaptation training epochs (ignored if adapter_dim=0)
     learning_rate : float, default=0.001
-        Learning rate for adapter and discriminator
+        Learning rate for adapter and discriminator (ignored if adapter_dim=0)
     device : str, default='auto'
         Device for computation
     return_reconstructed : bool, default=False
@@ -568,26 +436,33 @@ def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label
     Returns:
     --------
     adata_corrected : AnnData
-        Adapted query data with batch-corrected embeddings
+        Query data with batch-corrected embeddings
         
     Example:
     --------
-    >>> # Fast path (standard)
-    >>> adata_q = transform_query(model, adata_query)
+    >>> # Fast projection (no adaptation, < 1 second)
+    >>> adata_q = transform_query_adaptive(model, adata_query)
     >>> 
-    >>> # Adaptive path (advanced)
+    >>> # Adaptive projection (for domain shifts)
     >>> adata_q = transform_query_adaptive(
     ...     model, 
     ...     adata_query,
     ...     adata_reference=adata_ref[:500],  # Small reference sample
     ...     bio_label='celltype',
+    ...     adapter_dim=128,  # Enable adaptation
     ...     adaptation_epochs=50
     ... )
     """
     
     from .model import ResidualAdapter, DomainDiscriminator
     
-    print("🔬 ADAPTIVE QUERY PROJECTION (Domain Adaptation)")
+    # Check if we should do fast projection or adaptive projection
+    use_adapter = adapter_dim > 0
+    
+    if use_adapter:
+        print("🔬 ADAPTIVE QUERY PROJECTION (Domain Adaptation)")
+    else:
+        print("🚀 FAST QUERY PROJECTION (Direct)")
     print("="*50)
     
     # Set device
@@ -603,8 +478,13 @@ def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label
     
     print(f"   Device: {device}")
     print(f"   Query samples: {adata_query.shape[0]}")
-    print(f"   Adapter dimension: {adapter_dim}")
-    print(f"   Adaptation epochs: {adaptation_epochs}")
+    
+    if not use_adapter:
+        print(f"   Mode: Fast direct projection (adapter_dim=0)")
+        print(f"   ⚡ No adaptation - using frozen encoder only")
+    else:
+        print(f"   Mode: Adaptive projection (adapter_dim={adapter_dim})")
+        print(f"   Adaptation epochs: {adaptation_epochs}")
     
     # Prepare query data
     X_query = adata_query.X.copy()
@@ -618,6 +498,38 @@ def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label
     model.eval()
     for param in model.parameters():
         param.requires_grad = False
+    
+    # ====== FAST PATH: No Adapter (adapter_dim=0) ======
+    if not use_adapter:
+        print("\n🔄 Projecting through frozen encoder...")
+        print("   ✅ Encoder weights: FROZEN")
+        print("   ✅ No adaptation: Output = encoder(x)")
+        
+        with torch.no_grad():
+            if model.source_discriminator is not None:
+                corrected_embedding, reconstructed, _, _, _ = model(X_query_tensor)
+            else:
+                corrected_embedding, reconstructed, _, _ = model(X_query_tensor)
+            
+            corrected_embedding = corrected_embedding.cpu().numpy()
+            reconstructed = reconstructed.cpu().numpy()
+        
+        # Create output
+        adata_corrected = adata_query.copy()
+        adata_corrected.obsm['X_ScAdver'] = corrected_embedding
+        
+        print(f"✅ Projection complete!")
+        print(f"   Output embedding shape: {corrected_embedding.shape}")
+        
+        if return_reconstructed:
+            adata_corrected.layers['ScAdver_reconstructed'] = reconstructed
+            print(f"   Reconstructed expression shape: {reconstructed.shape}")
+        
+        return adata_corrected
+    
+    # ====== ADAPTIVE PATH: With Residual Adapter (adapter_dim > 0) ======
+    print("\n🏗️  Initializing residual adapter...")
+    print(f"   Architecture: latent_dim → {adapter_dim} → latent_dim")
     
     # Get latent dimension
     with torch.no_grad():
@@ -806,7 +718,7 @@ def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label
     else:
         print(f"   ✅ Adapted embedding: {adapted_embeddings.shape}")
     
-    print("\n🎉 ADAPTIVE PROJECTION COMPLETE!")
+    print("\n ADAPTIVE PROJECTION COMPLETE!")
     print(f"   Output: adata.obsm['X_ScAdver'] (adapted embeddings)")
     if return_reconstructed:
         print(f"   Output: adata.layers['ScAdver_reconstructed'] (batch-corrected expression)")

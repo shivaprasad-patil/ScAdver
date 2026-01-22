@@ -251,20 +251,22 @@ adata_ref_corrected, model, metrics = adversarial_batch_correction(
 torch.save(model.state_dict(), 'scadver_model.pt')
 
 # Step 3: Process queries as they arrive (NO retraining!)
-adata_query1 = transform_query(model, query_batch_1)  # < 1 sec
-adata_query2 = transform_query(model, query_batch_2)  # < 1 sec
-adata_query3 = transform_query(model, query_batch_3)  # < 1 sec
+# Fast mode (adapter_dim=0, default): < 1 sec
+adata_query1 = transform_query_adaptive(model, query_batch_1)  # < 1 sec
+adata_query2 = transform_query_adaptive(model, query_batch_2)  # < 1 sec
+adata_query3 = transform_query_adaptive(model, query_batch_3)  # < 1 sec
 ```
 
 ### Benefits
 
-| Aspect | Retraining Each Time | Using transform_query |
+| Aspect | Retraining Each Time | Using Unified Projection |
 |--------|---------------------|----------------------|
 | **Speed** | 10 min × 3 = 30 min | < 3 seconds total |
 | **Consistency** | Different models → incompatible embeddings | Same model → compatible embeddings |
 | **Bias** | Query affects training | Query doesn't affect model |
 | **Scalability** | Slow with many queries | Fast with unlimited queries |
 | **Storage** | Need to retrain each time | Save model once, reuse forever |
+| **Adaptation** | N/A | Optional residual adapter for domain shifts |
 
 ---
 
@@ -320,7 +322,8 @@ bio_sil = silhouette_score(Z, celltypes)   # Higher is better
 ## 📖 Further Reading
 
 - **Detailed mechanism**: See [ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md)
-- **Code example**: See [examples/incremental_query_example.py](examples/incremental_query_example.py)
+- **Residual adapters**: See [RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)
+- **Code example**: See [examples/query_projection_notebook.ipynb](examples/query_projection_notebook.ipynb)
 - **Visual diagrams**: Run `python examples/visualize_encoder_mechanism.py`
 
 ---
