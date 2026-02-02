@@ -18,18 +18,21 @@ ScAdver performs adversarial batch correction for single-cell RNA-seq data, elim
 pip install git+https://github.com/shivaprasad-patil/ScAdver.git
 ```
 
-## Quick Start
+## Usage Workflows
 
-### Basic Usage
+ScAdver offers **two flexible workflows** depending on your use case:
+
+### Workflow 1: All-in-One Batch Correction
+
+Process all data in a single call. Best for one-time analysis when all data is available upfront.
 
 ```python
 import scanpy as sc
 from scadver import adversarial_batch_correction
 
-# Load data
+# Load and correct data
 adata = sc.read("your_data.h5ad")
 
-# Run batch correction
 adata_corrected, model, metrics = adversarial_batch_correction(
     adata=adata,
     bio_label='celltype',
@@ -43,103 +46,20 @@ sc.tl.umap(adata_corrected)
 sc.pl.umap(adata_corrected, color=['celltype', 'batch'])
 ```
 
-### Query Processing
+**Optional: Reference-Query Split**
 
-ScAdver uses a unified projection approach with automatic domain shift detection:
-
-```python
-import torch
-from scadver import adversarial_batch_correction, transform_query_adaptive
-
-# Step 1: Train on reference (once)
-adata_ref_corrected, model, metrics = adversarial_batch_correction(
-    adata=adata_reference,
-    bio_label='celltype',
-    batch_label='tech',
-    epochs=500
-)
-
-# Step 2: Save model
-torch.save(model.state_dict(), 'scadver_model.pt')
-
-# Step 3: Project query data with automatic detection (RECOMMENDED)
-adata_query = transform_query_adaptive(
-    model=model,
-    adata_query=query_data,
-    adata_reference=adata_reference[:500],  # Small reference sample
-    adapter_dim='auto'  # Automatically detects domain shift (default)
-)
-
-# Step 4: Combine and analyze
-adata_all = sc.concat([adata_ref_corrected, adata_query])
-sc.pp.neighbors(adata_all, use_rep='X_ScAdver')
-sc.tl.umap(adata_all)
-```
-
-**Three Modes for Query Projection**:
-
-**1. Automatic Mode (adapter_dim='auto', RECOMMENDED)**:
-- 🤖 Automatically detects domain shift between reference and query
-- 📊 Analyzes MMD, distribution distances, and variance ratios
-- 🎯 Decides whether to use residual adapter
-- ✅ Best for unknown domain shift scenarios
-
-**2. Fast Mode (adapter_dim=0)**:
-- ⚡ Direct projection through frozen encoder
-- ✅ Perfect for similar protocols/technologies
-- ✅ Scales to unlimited query batches instantly
-- ✅ No adaptation overhead
-
-**3. Adaptive Mode (adapter_dim>0)**:
-- 🔬 Forces residual adapter for known domain shifts
-- ✅ Better for protocol differences (e.g., 10X → Smart-seq2)
-- ✅ Optional biological supervision for improved alignment
-- ⚠️ Slower: trains small adapter network (~50 epochs)
-
-**Example with different modes**:
-```python
-# Automatic detection (let ScAdver decide)
-adata_query = transform_query_adaptive(
-    model, query_data, 
-    adata_reference=ref[:500]
-)  # adapter_dim='auto' is default
-
-# Force fast mode for similar protocols
-adata_query_fast = transform_query_adaptive(
-    model, query_data, 
-    adapter_dim=0
-)
-
-# Force adaptive mode for known large shifts
-adata_query_adapted = transform_query_adaptive(
-    model, query_data,
-    adata_reference=ref[:500],
-    adapter_dim=128,
-    adaptation_epochs=50
-)
-```
-
-**Key Insight**: When `adapter_dim>0` but query is similar to reference, the adapter automatically learns to stay close to zero, making it equivalent to fast mode. This makes the framework robust and adaptive to the data's needs.
-
-## Usage Workflows
-
-ScAdver offers **two flexible workflows** depending on your use case:
-
-### Workflow 1: All-in-One (Process Everything Together)
-
-Train and correct all data in a single call. The model trains only on reference data but corrects both reference and query:
+If you want to train only on reference samples but correct both:
 
 ```python
 import numpy as np
-from scadver import adversarial_batch_correction
 
 # Mark which samples are Reference vs Query
 query_mask = np.array([tech in ["smartseq2", "celseq2"] for tech in adata.obs["tech"]])
 adata.obs['Source'] = np.where(query_mask, "Query", "Reference")
 
-# Train on Reference, correct both Reference and Query
+# Train on Reference only, correct both
 adata_corrected, model, metrics = adversarial_batch_correction(
-    adata=adata,  # All data
+    adata=adata,
     bio_label='celltype',
     batch_label='tech',
     reference_data='Reference',  # Model trains ONLY on these samples
@@ -149,15 +69,15 @@ adata_corrected, model, metrics = adversarial_batch_correction(
 ```
 
 **✅ Use when:**
-- You have all data available upfront
+- All data available upfront
 - One-time batch correction workflow
-- Want to process everything in a single step
+- Interactive analysis
 
-**Example**: See [examples/pancreas_example.py](examples/pancreas_example.py)
+**Example**: [examples/pancreas_example.py](examples/pancreas_example.py)
 
 ### Workflow 2: Train-Then-Project (Reusable Model)
 
-Train once on reference, then project unlimited query batches as they arrive:
+Train once on reference, then project unlimited query batches as they arrive. Features automatic domain shift detection.
 
 ```python
 import torch
@@ -174,27 +94,58 @@ adata_ref_corrected, model, metrics = adversarial_batch_correction(
 # Step 2: Save model for reuse
 torch.save(model.state_dict(), 'scadver_model.pt')
 
-# Step 3: Project queries as they arrive (unlimited batches!)
-# Fast mode (< 1 second per batch)
-adata_query1 = transform_query_adaptive(model, query_batch1)
-adata_query2 = transform_query_adaptive(model, query_batch2)
-adata_query3 = transform_query_adaptive(model, query_batch3)
-
-# Adaptive mode (for domain shifts)
-adata_query4 = transform_query_adaptive(
-    model, query_batch4,
-    adata_reference=adata_ref[:500],
-    adapter_dim=128,
-    adaptation_epochs=50
+# Step 3: Project query data with automatic detection (RECOMMENDED)
+adata_query = transform_query_adaptive(
+    model=model,
+    adata_query=query_data,
+    adata_reference=adata_reference[:500],  # Small reference sample
+    adapter_dim='auto'  # Automatically detects domain shift (default)
 )
+
+# Step 4: Combine and analyze
+adata_all = sc.concat([adata_ref_corrected, adata_query])
+sc.pp.neighbors(adata_all, use_rep='X_ScAdver')
+sc.tl.umap(adata_all)
 ```
 
-**✅ Use when:**
-- Query batches arrive over time (streaming data)
-- Want to reuse the same model for many queries
-- Deploying model as a service
+**Query Projection Modes**:
 
-**Example**: See [examples/query_projection_notebook.ipynb](examples/query_projection_notebook.ipynb)
+1. **Automatic Mode** (adapter_dim='auto', **RECOMMENDED**):
+   - 🤖 Automatically detects domain shift
+   - 📊 Analyzes MMD, distribution distances, variance ratios
+   - 🎯 Decides whether to use residual adapter
+   ```python
+   adata_query = transform_query_adaptive(model, query_data, adata_reference=ref[:500])
+   ```
+
+2. **Fast Mode** (adapter_dim=0):
+   - ⚡ Direct projection through frozen encoder (< 1 second)
+   - ✅ Perfect for similar protocols/technologies
+   ```python
+   adata_query = transform_query_adaptive(model, query_data, adapter_dim=0)
+   ```
+
+3. **Adaptive Mode** (adapter_dim>0):
+   - 🔬 Forces residual adapter for known domain shifts
+   - ✅ Better for protocol differences (e.g., 10X → Smart-seq2)
+   ```python
+   adata_query = transform_query_adaptive(
+       model, query_data,
+       adata_reference=ref[:500],
+       adapter_dim=128,
+       adaptation_epochs=50
+   )
+   ```
+
+**Key Insight**: When `adapter_dim>0` but query is similar to reference, the adapter automatically learns to stay close to zero, making it equivalent to fast mode.
+
+**✅ Use when:**
+- Query batches arrive over time
+- Need to process many query batches
+- Deploying model as a service
+- Want to reuse the same model
+
+**Example**: [examples/query_projection_notebook.ipynb](examples/query_projection_notebook.ipynb)
 
 ### Which Workflow to Choose?
 
@@ -202,7 +153,6 @@ adata_query4 = transform_query_adaptive(
 |----------|---------------------|
 | All data available now, one-time analysis | **Workflow 1** (All-in-One) |
 | Query batches arrive over time | **Workflow 2** (Train-Then-Project) |
-| Need to process 100+ query batches | **Workflow 2** (Train-Then-Project) |
 | Deploying as a service | **Workflow 2** (Train-Then-Project) |
 | Interactive analysis, have all data | **Workflow 1** (All-in-One) |
 
@@ -224,7 +174,6 @@ Once trained, the frozen encoder automatically applies this transformation to ne
 
 - **[ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md)** - How the encoder training and projection works
 - **[RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)** - Residual adapters for domain adaptation
-- **[Query Projection Notebook](examples/query_projection_notebook.ipynb)** - Fast vs adaptive comparison
 
 ## Citation
 
