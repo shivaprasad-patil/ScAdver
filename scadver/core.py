@@ -372,18 +372,167 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     return adata_corrected, model, metrics
 
 
+def detect_domain_shift(model, adata_query, adata_reference, device='auto', n_samples=1000):
+    """
+    Automatically detect domain shift between reference and query data.
+    
+    Analyzes multiple metrics to determine if residual adapter is needed:
+    1. Maximum Mean Discrepancy (MMD) in embedding space
+    2. Distribution distance in gene expression space
+    3. Embedding variance ratio
+    
+    Parameters:
+    -----------
+    model : AdversarialBatchCorrector
+        Pre-trained model with frozen encoder
+    adata_query : AnnData
+        Query data to project
+    adata_reference : AnnData
+        Reference data for comparison
+    device : str or torch.device
+        Device for computation
+    n_samples : int, default=1000
+        Number of samples to use for efficient computation
+    
+    Returns:
+    --------
+    dict : Dictionary with detection results
+        - 'needs_adapter': bool, whether adapter is recommended
+        - 'adapter_dim': int, recommended adapter dimension (0 or 128)
+        - 'mmd_score': float, MMD distance in embedding space
+        - 'expr_distance': float, distribution distance in expression space
+        - 'confidence': str, confidence level ('high', 'medium', 'low')
+    """
+    
+    # Set device
+    if device == 'auto':
+        if torch.backends.mps.is_available():
+            device = torch.device('mps')
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+    else:
+        device = torch.device(device)
+    
+    model = model.to(device)
+    model.eval()
+    
+    # Subsample if datasets are large
+    n_query = min(n_samples, adata_query.shape[0])
+    n_ref = min(n_samples, adata_reference.shape[0])
+    
+    query_idx = np.random.choice(adata_query.shape[0], n_query, replace=False)
+    ref_idx = np.random.choice(adata_reference.shape[0], n_ref, replace=False)
+    
+    # Prepare data
+    X_query = adata_query.X[query_idx].copy()
+    X_ref = adata_reference.X[ref_idx].copy()
+    
+    if hasattr(X_query, 'toarray'):
+        X_query = X_query.toarray()
+    if hasattr(X_ref, 'toarray'):
+        X_ref = X_ref.toarray()
+    
+    X_query = X_query.astype(np.float32)
+    X_ref = X_ref.astype(np.float32)
+    
+    X_query_tensor = torch.FloatTensor(X_query).to(device)
+    X_ref_tensor = torch.FloatTensor(X_ref).to(device)
+    
+    # Compute embeddings
+    with torch.no_grad():
+        z_query = model.encoder(X_query_tensor)
+        z_ref = model.encoder(X_ref_tensor)
+    
+    # Metric 1: Maximum Mean Discrepancy (MMD) in embedding space
+    def compute_mmd(x, y):
+        """Compute MMD using RBF kernel"""
+        xx = torch.mm(x, x.t())
+        yy = torch.mm(y, y.t())
+        xy = torch.mm(x, y.t())
+        
+        rx = xx.diag().unsqueeze(0).expand_as(xx)
+        ry = yy.diag().unsqueeze(0).expand_as(yy)
+        
+        dxx = rx.t() + rx - 2. * xx
+        dyy = ry.t() + ry - 2. * yy
+        dxy = rx.t() + ry - 2. * xy
+        
+        # Use multiple bandwidths
+        XX, YY, XY = 0, 0, 0
+        for bandwidth in [0.5, 1.0, 2.0, 5.0]:
+            XX += torch.exp(-0.5 * dxx / bandwidth)
+            YY += torch.exp(-0.5 * dyy / bandwidth)
+            XY += torch.exp(-0.5 * dxy / bandwidth)
+        
+        return (XX.mean() + YY.mean() - 2. * XY.mean()).item()
+    
+    mmd_score = compute_mmd(z_query, z_ref)
+    
+    # Metric 2: Distribution distance in expression space (using mean/std)
+    expr_distance = np.sqrt(
+        np.mean((X_query.mean(axis=0) - X_ref.mean(axis=0)) ** 2) +
+        np.mean((X_query.std(axis=0) - X_ref.std(axis=0)) ** 2)
+    )
+    
+    # Metric 3: Embedding variance ratio
+    var_query = z_query.var(dim=0).mean().item()
+    var_ref = z_ref.var(dim=0).mean().item()
+    var_ratio = abs(var_query - var_ref) / (var_ref + 1e-6)
+    
+    # Decision thresholds
+    mmd_threshold = 0.2
+    expr_threshold = 0.5
+    var_threshold = 0.3
+    
+    # Count how many metrics suggest adaptation
+    votes = 0
+    if mmd_score > mmd_threshold:
+        votes += 1
+    if expr_distance > expr_threshold:
+        votes += 1
+    if var_ratio > var_threshold:
+        votes += 1
+    
+    # Make decision
+    needs_adapter = votes >= 2  # Majority vote
+    adapter_dim = 128 if needs_adapter else 0
+    
+    # Determine confidence
+    if votes == 3 or votes == 0:
+        confidence = 'high'
+    elif mmd_score > mmd_threshold * 1.5 or mmd_score < mmd_threshold * 0.5:
+        confidence = 'high'
+    else:
+        confidence = 'medium'
+    
+    result = {
+        'needs_adapter': needs_adapter,
+        'adapter_dim': adapter_dim,
+        'mmd_score': mmd_score,
+        'expr_distance': expr_distance,
+        'var_ratio': var_ratio,
+        'confidence': confidence,
+        'votes': votes
+    }
+    
+    return result
+
+
 def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label=None,
-                            adapter_dim=0, adaptation_epochs=50, learning_rate=0.001,
+                            adapter_dim='auto', adaptation_epochs=50, learning_rate=0.001,
                             device='auto', return_reconstructed=False):
     """
-    Unified query projection with optional residual domain adaptation.
+    Unified query projection with automatic or manual domain adaptation.
     
-    This function projects query data using the pre-trained encoder. By default (adapter_dim=0),
-    it performs fast, direct projection. When adapter_dim > 0, it trains a lightweight residual
-    adapter for handling domain shifts.
+    This function projects query data using the pre-trained encoder. It can automatically
+    detect domain shifts and decide whether to use a residual adapter, or you can manually
+    specify the behavior.
     
     **Unified Behavior:**
-    - adapter_dim=0 (default): Fast direct projection, no adaptation (< 1 second)
+    - adapter_dim='auto' (default): Automatic domain shift detection
+    - adapter_dim=0: Fast direct projection, no adaptation (< 1 second)
     - adapter_dim>0: Adaptive projection with residual adapter (handles domain shifts)
     
     When adapter_dim=0, the residual adapter is effectively zero, so:
@@ -415,15 +564,16 @@ def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label
     adata_query : AnnData
         Query data to project
     adata_reference : AnnData, optional
-        Reference data for domain alignment (required if adapter_dim > 0)
+        Reference data for domain alignment (required if adapter_dim > 0 or 'auto')
         Small subset sufficient (e.g., 500 cells)
     bio_label : str, optional
         Biological label column for supervised adaptation
         Enables biology-preserving loss on query data
-    adapter_dim : int, default=0
+    adapter_dim : int or 'auto', default='auto'
         Hidden dimension of residual adapter
+        - 'auto': Automatically detect domain shift and decide (recommended)
         - 0: Fast direct projection (no adaptation)
-        - >0: Adaptive projection with domain adaptation
+        - >0 (e.g., 128): Adaptive projection with domain adaptation
     adaptation_epochs : int, default=50
         Number of adaptation training epochs (ignored if adapter_dim=0)
     learning_rate : float, default=0.001
@@ -440,21 +590,55 @@ def transform_query_adaptive(model, adata_query, adata_reference=None, bio_label
         
     Example:
     --------
-    >>> # Fast projection (no adaptation, < 1 second)
-    >>> adata_q = transform_query_adaptive(model, adata_query)
-    >>> 
-    >>> # Adaptive projection (for domain shifts)
+    >>> # Automatic detection (recommended)
     >>> adata_q = transform_query_adaptive(
     ...     model, 
     ...     adata_query,
-    ...     adata_reference=adata_ref[:500],  # Small reference sample
+    ...     adata_reference=adata_ref[:500]  # Small reference sample
+    ... )
+    >>> 
+    >>> # Fast projection (no adaptation, < 1 second)
+    >>> adata_q = transform_query_adaptive(model, adata_query, adapter_dim=0)
+    >>> 
+    >>> # Force adaptive projection (for known domain shifts)
+    >>> adata_q = transform_query_adaptive(
+    ...     model, 
+    ...     adata_query,
+    ...     adata_reference=adata_ref[:500],
     ...     bio_label='celltype',
-    ...     adapter_dim=128,  # Enable adaptation
+    ...     adapter_dim=128,
     ...     adaptation_epochs=50
     ... )
     """
     
     from .model import ResidualAdapter, DomainDiscriminator
+    
+    # Handle automatic domain shift detection
+    if adapter_dim == 'auto':
+        if adata_reference is None:
+            print("⚠️  Warning: adapter_dim='auto' requires adata_reference for comparison")
+            print("   Falling back to fast direct projection (adapter_dim=0)")
+            adapter_dim = 0
+        else:
+            print("🤖 AUTO-DETECTING DOMAIN SHIFT...")
+            print("="*50)
+            detection_result = detect_domain_shift(model, adata_query, adata_reference, device)
+            
+            adapter_dim = detection_result['adapter_dim']
+            
+            print(f"   📊 Domain Shift Metrics:")
+            print(f"      MMD Score: {detection_result['mmd_score']:.4f}")
+            print(f"      Expression Distance: {detection_result['expr_distance']:.4f}")
+            print(f"      Variance Ratio: {detection_result['var_ratio']:.4f}")
+            print(f"   🎯 Decision: {'ADAPTER NEEDED' if detection_result['needs_adapter'] else 'DIRECT PROJECTION'}")
+            print(f"      Confidence: {detection_result['confidence'].upper()}")
+            print(f"      Recommended adapter_dim: {adapter_dim}")
+            
+            if detection_result['needs_adapter']:
+                print(f"   💡 Domain shift detected - will use residual adapter for better alignment")
+            else:
+                print(f"   ✅ Domains are similar - fast direct projection is sufficient")
+            print()
     
     # Check if we should do fast projection or adaptive projection
     use_adapter = adapter_dim > 0

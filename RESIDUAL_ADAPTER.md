@@ -71,19 +71,56 @@ By keeping the encoder `E` frozen and only training `R`:
 
 ---
 
+## Automatic Domain Shift Detection
+
+ScAdver now automatically detects domain shifts and decides whether to use a residual adapter!
+
+```python
+# Let ScAdver decide automatically (recommended)
+adata_query = transform_query_adaptive(
+    model=model,
+    adata_query=query_data,
+    adata_reference=adata_reference[:500],  # Small reference sample
+    adapter_dim='auto'  # Default - automatic detection
+)
+```
+
+**How it works:**
+1. Computes Maximum Mean Discrepancy (MMD) in embedding space
+2. Measures distribution distances in expression space
+3. Analyzes variance ratios between domains
+4. Makes a decision with confidence score (high/medium/low)
+
+**Detection Output:**
+```
+🤖 AUTO-DETECTING DOMAIN SHIFT...
+==================================================
+   📊 Domain Shift Metrics:
+      MMD Score: 0.3421
+      Expression Distance: 0.6234
+      Variance Ratio: 0.4123
+   🎯 Decision: ADAPTER NEEDED
+      Confidence: HIGH
+      Recommended adapter_dim: 128
+   💡 Domain shift detected - will use residual adapter for better alignment
+```
+
+---
+
 ## When to Use Each Mode
 
 | Scenario | adapter_dim | Why |
 |----------|-------------|-----|
-| **10X v2 → 10X v3** | 0 (default) | Similar protocols |
-| **10X → Smart-seq2** | 128 | Large technology shift |
-| **Same lab, different batches** | 0 | Technical replicates |
+| **Unknown domain shift** | `'auto'` (default) | Let ScAdver decide automatically |
+| **10X v2 → 10X v3** | 0 or `'auto'` | Similar protocols (auto will select 0) |
+| **10X → Smart-seq2** | 128 or `'auto'` | Large technology shift (auto will select 128) |
+| **Same lab, different batches** | 0 or `'auto'` | Technical replicates |
 | **Cross-species transfer** | 128-256 | Domain adaptation needed |
-| **Processing many batches** | 0 | Speed critical |
-| **Streaming/real-time** | 0 | Fast inference |
-| **Quality-critical analysis** | 128 | Better alignment |
+| **Processing many batches** | 0 | Speed critical (skip detection) |
+| **Streaming/real-time** | 0 | Fast inference (skip detection) |
+| **Quality-critical analysis** | `'auto'` or 128 | Better alignment with adaptation |
 
-## Usage Example
+## Usage Examples
 
 ```python
 from scadver import adversarial_batch_correction, transform_query_adaptive
@@ -96,17 +133,28 @@ adata_ref, model, metrics = adversarial_batch_correction(
     epochs=500
 )
 
-# Fast mode (adapter_dim=0, default) - Similar protocols
-adata_query1 = transform_query_adaptive(model, query_batch1)
-adata_query2 = transform_query_adaptive(model, query_batch2)
+# ===== AUTOMATIC MODE (RECOMMENDED) =====
+# ScAdver automatically detects domain shift
+adata_query = transform_query_adaptive(
+    model=model,
+    adata_query=query_data,
+    adata_reference=adata_reference[:500],  # Small reference sample
+    adapter_dim='auto'  # Automatic detection (default)
+)
 
-# Adaptive mode (adapter_dim>0) - Large domain shift
+# ===== FAST MODE =====
+# Fast direct projection (adapter_dim=0) - Similar protocols
+adata_query1 = transform_query_adaptive(model, query_batch1, adapter_dim=0)
+adata_query2 = transform_query_adaptive(model, query_batch2, adapter_dim=0)
+
+# ===== ADAPTIVE MODE =====
+# Force adaptive mode (adapter_dim>0) - Known large domain shift
 adata_query_smartseq = transform_query_adaptive(
     model=model,
     adata_query=smartseq_batch,
     adata_reference=adata_reference[:500],  # Small reference sample
     bio_label='celltype',                    # Optional supervision
-    adapter_dim=128,                         # Enable residual adapter
+    adapter_dim=128,                         # Force residual adapter
     adaptation_epochs=50
 )
 ```

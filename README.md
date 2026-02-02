@@ -45,7 +45,7 @@ sc.pl.umap(adata_corrected, color=['celltype', 'batch'])
 
 ### Query Processing
 
-ScAdver uses a unified projection approach with optional residual adapters:
+ScAdver uses a unified projection approach with automatic domain shift detection:
 
 ```python
 import torch
@@ -62,41 +62,62 @@ adata_ref_corrected, model, metrics = adversarial_batch_correction(
 # Step 2: Save model
 torch.save(model.state_dict(), 'scadver_model.pt')
 
-# Step 3a: Fast projection (adapter_dim=0)
-adata_query1 = transform_query_adaptive(model, adata_query_batch1)
-adata_query2 = transform_query_adaptive(model, adata_query_batch2)
-# ... unlimited batches
-
-# Step 3b: Adaptive projection (for domain shifts, adapter_dim>0)
-adata_query_adapted = transform_query_adaptive(
+# Step 3: Project query data with automatic detection (RECOMMENDED)
+adata_query = transform_query_adaptive(
     model=model,
-    adata_query=adata_query,
+    adata_query=query_data,
     adata_reference=adata_reference[:500],  # Small reference sample
-    bio_label='celltype',  # Optional: enables supervised adaptation
-    adapter_dim=128,  # Enable residual adapter
-    adaptation_epochs=50
+    adapter_dim='auto'  # Automatically detects domain shift (default)
 )
 
 # Step 4: Combine and analyze
-adata_all = sc.concat([adata_ref_corrected, adata_query1, adata_query2])
+adata_all = sc.concat([adata_ref_corrected, adata_query])
 sc.pp.neighbors(adata_all, use_rep='X_ScAdver')
 sc.tl.umap(adata_all)
 ```
 
-**Unified Approach with Residual Adapters**:
+**Three Modes for Query Projection**:
 
-**Fast Mode (adapter_dim=0, default)**:
+**1. Automatic Mode (adapter_dim='auto', RECOMMENDED)**:
+- 🤖 Automatically detects domain shift between reference and query
+- 📊 Analyzes MMD, distribution distances, and variance ratios
+- 🎯 Decides whether to use residual adapter
+- ✅ Best for unknown domain shift scenarios
+
+**2. Fast Mode (adapter_dim=0)**:
 - ⚡ Direct projection through frozen encoder
-- ✅ No adaptation needed: adapter mathematically reduces to zero
 - ✅ Perfect for similar protocols/technologies
-- ✅ Scales to unlimited query batches
+- ✅ Scales to unlimited query batches instantly
+- ✅ No adaptation overhead
 
-**Adaptive Mode (adapter_dim>0)**:
-- 🔬 Residual adapter handles domain shifts
+**3. Adaptive Mode (adapter_dim>0)**:
+- 🔬 Forces residual adapter for known domain shifts
 - ✅ Better for protocol differences (e.g., 10X → Smart-seq2)
 - ✅ Optional biological supervision for improved alignment
 - ⚠️ Slower: trains small adapter network (~50 epochs)
-- ✅ Adapter learns to be near-zero if no adaptation needed
+
+**Example with different modes**:
+```python
+# Automatic detection (let ScAdver decide)
+adata_query = transform_query_adaptive(
+    model, query_data, 
+    adata_reference=ref[:500]
+)  # adapter_dim='auto' is default
+
+# Force fast mode for similar protocols
+adata_query_fast = transform_query_adaptive(
+    model, query_data, 
+    adapter_dim=0
+)
+
+# Force adaptive mode for known large shifts
+adata_query_adapted = transform_query_adaptive(
+    model, query_data,
+    adata_reference=ref[:500],
+    adapter_dim=128,
+    adaptation_epochs=50
+)
+```
 
 **Key Insight**: When `adapter_dim>0` but query is similar to reference, the adapter automatically learns to stay close to zero, making it equivalent to fast mode. This makes the framework robust and adaptive to the data's needs.
 
