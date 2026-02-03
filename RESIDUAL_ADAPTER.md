@@ -2,18 +2,26 @@
 
 ## Overview
 
-ScAdver uses a **unified query projection function** with two modes controlled by `adapter_dim`:
+ScAdver uses **fully automatic query projection** that intelligently adapts to domain shifts:
 
-### Fast Mode (`adapter_dim=0`, default)
+### How It Works
+1. **Automatic Detection**: Trains a test residual adapter and measures ||R(z)||
+2. **Simple Decision**: 
+   - If R ≈ 0 → Domains are similar, uses fast direct projection
+   - If R > 0 → Domain shift detected, trains residual adapter
+3. **No Manual Tuning**: System decides the best approach automatically
+
+### Two Modes (Automatically Selected)
+
+**Fast Mode (when R ≈ 0)**:
 - **Approach**: Direct projection through frozen encoder
-- **Best for**: Similar protocols, speed-critical applications
+- **When used**: Similar protocols, no domain shift detected
 - **Output**: `z = encoder(x)`
 
-### Adaptive Mode (`adapter_dim>0`)
+**Adaptive Mode (when R > 0)**:
 - **Approach**: Trains lightweight residual adapter
-- **Best for**: Large domain shifts (e.g., 10X → Smart-seq2)
+- **When used**: Domain shift detected (e.g., 10X → Smart-seq2)
 - **Output**: `z' = encoder(x) + adapter(encoder(x))`
-- **Key insight**: Adapter learns to be ≈0 when domains are similar
 
 ---
 
@@ -73,7 +81,15 @@ By keeping the encoder `E` frozen and only training `R`:
 
 ## Automatic Domain Shift Detection
 
-ScAdver now automatically detects domain shifts and decides whether to use a residual adapter!
+ScAdver now automatically detects domain shifts using **residual magnitude analysis**!
+
+ScAdver directly tests if adaptation is needed by:
+1. **Training a test residual adapter** in adaptive mode for ~30 epochs
+2. **Measuring the residual magnitude**: ||R(z)|| across all query samples
+3. **Making a decision**:
+   - If R ≈ 0 → No domain shift, use direct projection
+   - If R > 0 → Domain shift exists, use residual adapter
+
 
 ```python
 # Let ScAdver decide automatically (recommended)
@@ -81,46 +97,22 @@ adata_query = transform_query_adaptive(
     model=model,
     adata_query=query_data,
     adata_reference=adata_reference[:500],  # Small reference sample
-    adapter_dim='auto'  # Default - automatic detection
+    bio_label='celltype',  # Optional: improves detection accuracy
+    adapter_dim='auto'  # Default - automatic detection via residual test
 )
 ```
 
-**How it works:**
-1. Computes Maximum Mean Discrepancy (MMD) in embedding space
-2. Measures distribution distances in expression space
-3. Analyzes variance ratios between domains
-4. Makes a decision with confidence score (high/medium/low)
+**Simple Decision Rule:**
+- **||R|| ≈ 0** (< 0.1): No domain shift → Direct projection
+- **||R|| > 0** (≥ 0.1): Domain shift detected → Use residual adapter
 
-**Detection Output:**
-```
-🤖 AUTO-DETECTING DOMAIN SHIFT...
-==================================================
-   📊 Domain Shift Metrics:
-      MMD Score: 0.3421
-      Expression Distance: 0.6234
-      Variance Ratio: 0.4123
-   🎯 Decision: ADAPTER NEEDED
-      Confidence: HIGH
-      Recommended adapter_dim: 128
-   💡 Domain shift detected - will use residual adapter for better alignment
-```
+The threshold of 0.1 accounts for numerical noise while keeping the decision simple and automatic.
 
 ---
 
-## When to Use Each Mode
+## Usage Example
 
-| Scenario | adapter_dim | Why |
-|----------|-------------|-----|
-| **Unknown domain shift** | `'auto'` (default) | Let ScAdver decide automatically |
-| **10X v2 → 10X v3** | 0 or `'auto'` | Similar protocols (auto will select 0) |
-| **10X → Smart-seq2** | 128 or `'auto'` | Large technology shift (auto will select 128) |
-| **Same lab, different batches** | 0 or `'auto'` | Technical replicates |
-| **Cross-species transfer** | 128-256 | Domain adaptation needed |
-| **Processing many batches** | 0 | Speed critical (skip detection) |
-| **Streaming/real-time** | 0 | Fast inference (skip detection) |
-| **Quality-critical analysis** | `'auto'` or 128 | Better alignment with adaptation |
-
-## Usage Examples
+ScAdver now has **one unified automatic mode** that handles everything:
 
 ```python
 from scadver import adversarial_batch_correction, transform_query_adaptive
@@ -133,30 +125,19 @@ adata_ref, model, metrics = adversarial_batch_correction(
     epochs=500
 )
 
-# ===== AUTOMATIC MODE (RECOMMENDED) =====
-# ScAdver automatically detects domain shift
+# Project query data - fully automatic!
+# ScAdver detects domain shift and chooses the best approach
 adata_query = transform_query_adaptive(
     model=model,
     adata_query=query_data,
     adata_reference=adata_reference[:500],  # Small reference sample
-    adapter_dim='auto'  # Automatic detection (default)
+    bio_label='celltype'  # Optional but recommended
 )
 
-# ===== FAST MODE =====
-# Fast direct projection (adapter_dim=0) - Similar protocols
-adata_query1 = transform_query_adaptive(model, query_batch1, adapter_dim=0)
-adata_query2 = transform_query_adaptive(model, query_batch2, adapter_dim=0)
-
-# ===== ADAPTIVE MODE =====
-# Force adaptive mode (adapter_dim>0) - Known large domain shift
-adata_query_smartseq = transform_query_adaptive(
-    model=model,
-    adata_query=smartseq_batch,
-    adata_reference=adata_reference[:500],  # Small reference sample
-    bio_label='celltype',                    # Optional supervision
-    adapter_dim=128,                         # Force residual adapter
-    adaptation_epochs=50
-)
+# That's it! No manual tuning needed.
+# System automatically decides:
+# - If R ≈ 0: Uses fast direct projection
+# - If R > 0: Trains and applies residual adapter
 ```
 
 ---
@@ -242,10 +223,9 @@ learning_rate = 0.001      # Learning rate
 
 ## Limitations
 
-1. **Computational cost**: Adaptive mode (adapter_dim>0) requires training, while fast mode is direct projection
-2. **Requires reference sample**: Adaptive mode needs small reference subset for alignment
-3. **Per-query training**: Each new domain with large shift needs separate adapter training
-4. **Hyperparameters**: May need tuning for optimal performance
+1. **Requires reference sample**: Adaptive mode needs small reference subset for alignment
+2. **Per-query training**: Each new domain with large shift needs separate adapter training
+3. **Hyperparameters**: May need tuning for optimal performance
 
 **Key Innovation**: The unified approach is self-adaptive—when adapter_dim>0 but domains are similar, the adapter automatically learns to output ≈0, making it equivalent to fast mode. This robustness eliminates the need to manually choose between methods.
 

@@ -94,12 +94,12 @@ adata_ref_corrected, model, metrics = adversarial_batch_correction(
 # Step 2: Save model for reuse
 torch.save(model.state_dict(), 'scadver_model.pt')
 
-# Step 3: Project query data with automatic detection (RECOMMENDED)
+# Step 3: Project query data (fully automatic)
 adata_query = transform_query_adaptive(
     model=model,
     adata_query=query_data,
     adata_reference=adata_reference[:500],  # Small reference sample
-    adapter_dim='auto'  # Automatically detects domain shift (default)
+    bio_label='celltype'  # Optional: improves detection
 )
 
 # Step 4: Combine and analyze
@@ -108,36 +108,25 @@ sc.pp.neighbors(adata_all, use_rep='X_ScAdver')
 sc.tl.umap(adata_all)
 ```
 
-**Query Projection Modes**:
+**How Query Projection Works**:
 
-1. **Automatic Mode** (adapter_dim='auto', **RECOMMENDED**):
-   - 🤖 Automatically detects domain shift
-   - 📊 Analyzes MMD, distribution distances, variance ratios
-   - 🎯 Decides whether to use residual adapter
-   ```python
-   adata_query = transform_query_adaptive(model, query_data, adata_reference=ref[:500])
-   ```
+ScAdver uses **intelligent automatic mode** that detects domain shifts and decides the best approach:
 
-2. **Fast Mode** (adapter_dim=0):
-   - ⚡ Direct projection through frozen encoder (< 1 second)
-   - ✅ Perfect for similar protocols/technologies
-   ```python
-   adata_query = transform_query_adaptive(model, query_data, adapter_dim=0)
-   ```
+- 🤖 **Automatic Detection**: Trains test adapter and measures residual magnitude ||R(z)||
+- 🎯 **Simple Decision Rule**: 
+  - If R ≈ 0 → Domains similar, uses fast direct projection
+  - If R > 0 → Domain shift detected, trains residual adapter
+- ✅ **Always Optimal**: No manual tuning needed, system decides for you
 
-3. **Adaptive Mode** (adapter_dim>0):
-   - 🔬 Forces residual adapter for known domain shifts
-   - ✅ Better for protocol differences (e.g., 10X → Smart-seq2)
-   ```python
-   adata_query = transform_query_adaptive(
-       model, query_data,
-       adata_reference=ref[:500],
-       adapter_dim=128,
-       adaptation_epochs=50
-   )
-   ```
-
-**Key Insight**: When `adapter_dim>0` but query is similar to reference, the adapter automatically learns to stay close to zero, making it equivalent to fast mode.
+```python
+# Simply call transform_query_adaptive - it handles everything automatically
+adata_query = transform_query_adaptive(
+    model, 
+    query_data, 
+    adata_reference=ref[:500],
+    bio_label='celltype'  # Optional but recommended
+)
+```
 
 **✅ Use when:**
 - Query batches arrive over time
