@@ -29,13 +29,14 @@ Pass all data in a single call. The model trains on everything and returns corre
 **✅ Use when** all data is available upfront and no new query batches are expected.
 
 ```python
-from scadver import adversarial_batch_correction, set_global_seed
-set_global_seed(42)
+from scadver import adversarial_batch_correction
 adata_corrected, model, metrics = adversarial_batch_correction(
     adata=adata, bio_label='celltype', batch_label='batch',
     epochs=500, device='auto', return_reconstructed=True, seed=42,
 )
 ```
+
+> `seed=42` is sufficient — the function calls `set_global_seed()` internally. Use the standalone `set_global_seed(42)` only if you need to also seed preprocessing steps (HVG selection, data splits) that happen before the function call.
 
 ---
 
