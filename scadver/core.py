@@ -165,7 +165,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         
     else:
         source_labels = None
-        print(f"   Training on all provided data (pre-split externally)")
+        print(f"   Training on all provided data (global correction mode)")
         # Use all data for training when no reference-query split
         X_train = X
         bio_labels_train = bio_labels
