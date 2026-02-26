@@ -4,6 +4,40 @@ Neural network model for adversarial batch correction.
 
 import torch
 import torch.nn as nn
+import torch.nn.init as init
+
+
+# ---------------------------------------------------------------------------
+# Weight initialisation helpers
+# ---------------------------------------------------------------------------
+
+def _xavier_init(module, gain=0.01, seed=None):
+    """Deterministic Xavier (Glorot) initialisation for a single module."""
+    if seed is not None:
+        rng_state = torch.random.get_rng_state()
+        torch.manual_seed(seed)
+    if isinstance(module, nn.Linear):
+        init.xavier_uniform_(module.weight, gain=gain)
+        if module.bias is not None:
+            init.zeros_(module.bias)
+    if seed is not None:
+        torch.random.set_rng_state(rng_state)
+
+
+def initialize_weights_deterministically(model, seed=42, gain=0.01):
+    """
+    Apply deterministic Xavier initialisation to every Linear layer in *model*.
+    
+    Each layer gets a unique sub-seed derived from *seed* so that the
+    initialisation is independent of layer ordering in other models.
+    """
+    rng_state = torch.random.get_rng_state()
+    layer_idx = 0
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            _xavier_init(module, gain=gain, seed=seed + layer_idx)
+            layer_idx += 1
+    torch.random.set_rng_state(rng_state)
 
 
 class AdversarialBatchCorrector(nn.Module):
@@ -138,6 +172,82 @@ class ResidualAdapter(nn.Module):
     def forward(self, z):
         """Add residual correction to latent embedding"""
         return z + self.adapter(z)
+
+
+class EnhancedResidualAdapter(nn.Module):
+    """
+    Multi-layer residual adapter with skip connections, layer normalisation,
+    bounded outputs, and a learnable scaling parameter.
+    
+    Architecture
+    ------------
+    z  ─┬─ Linear → LN → GELU → Dropout ─┐  (layer 1)
+        │                                   │
+        │  Linear → LN → GELU → Dropout ───┤  (layer 2)
+        │                                   │
+        │  Linear → Tanh ──────────────────→ * scale
+        │                                   │
+        └───────────────────────────────────+ → z'
+    
+    The Tanh bounds the raw residual to [-1, 1] and the learnable ``scale``
+    parameter (initialised small) controls the effective magnitude, allowing
+    the adapter to start near identity and grow as needed.
+    
+    Parameters
+    ----------
+    latent_dim : int
+        Dimensionality of the latent space.
+    adapter_dim : int
+        Hidden dimension inside the adapter (default 128).
+    n_layers : int
+        Number of hidden layers (default 3).
+    dropout : float
+        Dropout probability (default 0.1).
+    init_scale : float
+        Initial value for the learnable scaling parameter (default 0.01).
+    seed : int or None
+        If given, applies deterministic Xavier init.
+    """
+    
+    def __init__(self, latent_dim, adapter_dim=128, n_layers=3, dropout=0.1,
+                 init_scale=0.01, seed=None):
+        super().__init__()
+        
+        layers = []
+        in_dim = latent_dim
+        for i in range(n_layers - 1):
+            out_dim = adapter_dim
+            layers.append(nn.Linear(in_dim, out_dim))
+            layers.append(nn.LayerNorm(out_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout))
+            in_dim = out_dim
+        
+        # Final projection back to latent_dim with Tanh bound
+        layers.append(nn.Linear(in_dim, latent_dim))
+        layers.append(nn.Tanh())
+        
+        self.adapter = nn.Sequential(*layers)
+        
+        # Skip-connection projection (for when adapter_dim != latent_dim at intermediate layers)
+        # This is simply the identity; the skip is z itself.
+        
+        # Learnable scaling — starts small so the adapter is near-identity
+        self.scale = nn.Parameter(torch.tensor(init_scale))
+        
+        # Deterministic init
+        if seed is not None:
+            initialize_weights_deterministically(self, seed=seed, gain=0.01)
+    
+    def forward(self, z):
+        """z' = z + scale * adapter(z)"""
+        residual = self.adapter(z)
+        return z + self.scale * residual
+    
+    @property
+    def effective_scale(self):
+        """Current magnitude of the scaling parameter (for monitoring)."""
+        return self.scale.item()
 
 
 class DomainDiscriminator(nn.Module):
