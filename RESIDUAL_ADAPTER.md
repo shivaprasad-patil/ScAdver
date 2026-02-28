@@ -196,7 +196,7 @@ for epoch in range(adaptation_epochs):
 #   ≤ 20  classes → 5.0   (strong supervision)
 #   ≤ 100 classes → 1.0
 #   ≤ 500 classes → 0.2
-#   > 500 classes → 0.02  (e.g. 1680 perturbations — alignment dominates)
+#   > 500 classes → 0.02  (alignment dominates)
 #   overlap < 30% → 0.0   (bio supervision disabled — noisy gradients)
 ```
 
