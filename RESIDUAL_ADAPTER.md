@@ -186,10 +186,18 @@ for epoch in range(adaptation_epochs):
     # Train discriminator
     loss_D = CE(D(z_ref), 0) + CE(D(z'_query), 1)
     
-    # Train adapter (adversarial + bio + recon)
-    loss_R = -CE(D(z'_query), 0) +          # Fool discriminator
-             5.0 * CE(Bio(z'_query), y) +   # Preserve biology
-             0.1 * MSE(Dec(z'), Dec(z))     # Preserve info
+    # Train adapter (adversarial + alignment + bio + recon)
+    loss_R = (1.0  * CE(D(z'_query), label=ref)          # Fool discriminator
+            + 3.0  * Align(z_ref, z'_query)               # MMD + CORAL + moments
+            + w_bio * CE(Bio(z'_query), y)                # Preserve biology (adaptive)
+            + 0.1  * MSE(Dec(z'), Dec(z)))                # Preserve info
+
+# w_bio is adaptive based on number of bio classes and class overlap:
+#   ≤ 20  classes → 5.0   (strong supervision)
+#   ≤ 100 classes → 1.0
+#   ≤ 500 classes → 0.2
+#   > 500 classes → 0.02  (e.g. 1680 perturbations — alignment dominates)
+#   overlap < 30% → 0.0   (bio supervision disabled — noisy gradients)
 ```
 
 ---
@@ -217,7 +225,8 @@ learning_rate = 0.001      # Learning rate
 
 **For better biological preservation:**
 - Provide `bio_label` (enables supervised loss)
-- Increase bio loss weight (hardcoded at 5.0, can modify source)
+- Bio loss weight is automatically scaled by class count (5.0 for ≤20 classes, 0.02 for >500 classes)
+- If class overlap between query and reference is <30%, bio supervision is disabled automatically to avoid noisy gradients
 
 ---
 

@@ -837,15 +837,56 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         X_ref_tensor = None
         print("   ⚠️  No reference data: Using unsupervised adaptation")
     
-    # 4f. Biological labels
-    bio_loss_fn = None
+    # 4f. Biological labels with adaptive weight
+    bio_loss_fn       = None
     bio_labels_tensor = None
+    adaptive_bio_weight = 0.0
+
     if bio_label is not None and bio_label in adata_query.obs.columns:
-        bio_enc = LabelEncoder()
-        bio_labels = bio_enc.fit_transform(adata_query.obs[bio_label])
-        bio_labels_tensor = torch.LongTensor(bio_labels).to(device)
-        bio_loss_fn = nn.CrossEntropyLoss()
-        print(f"   Biological supervision: {bio_label} ({len(bio_enc.classes_)} classes)")
+        # Infer number of output classes from the reference bio_classifier's final Linear layer
+        ref_n_classes = None
+        for layer in reversed(list(model.bio_classifier.modules())):
+            if isinstance(layer, nn.Linear):
+                ref_n_classes = layer.out_features
+                break
+
+        n_query_classes = len(adata_query.obs[bio_label].unique())
+
+        # Overlap ratio: how many query classes fit inside the ref classifier's vocabulary?
+        overlap_ratio = min(n_query_classes, ref_n_classes) / max(n_query_classes, 1) \
+                        if ref_n_classes else 0.0
+
+        print(f"   Bio label      : {bio_label}")
+        print(f"   Query classes  : {n_query_classes}")
+        print(f"   Ref classifier : {ref_n_classes} output classes")
+        print(f"   Overlap ratio  : {overlap_ratio:.1%}")
+
+        if overlap_ratio < 0.3:
+            # Poor overlap — ref-classifier gradients would be harmful noise
+            print("   ⚠️  Bio supervision DISABLED — class overlap too low (<30%)")
+        else:
+            # Scale weight DOWN as class count grows:
+            #   ≤20  classes → 5.0   (strong supervision)
+            #   ≤100 classes → 1.0
+            #   ≤500 classes → 0.2
+            #   >500 classes → 0.02  (e.g. 1680 perturbations)
+            if n_query_classes <= 20:
+                adaptive_bio_weight = 5.0
+            elif n_query_classes <= 100:
+                adaptive_bio_weight = 1.0
+            elif n_query_classes <= 500:
+                adaptive_bio_weight = 0.2
+            else:
+                adaptive_bio_weight = 0.02
+
+            bio_enc = LabelEncoder()
+            bio_labels_raw = bio_enc.fit_transform(adata_query.obs[bio_label])
+            # Clamp indices to ref classifier's output range to prevent index errors
+            if ref_n_classes is not None:
+                bio_labels_raw = np.clip(bio_labels_raw, 0, ref_n_classes - 1)
+            bio_labels_tensor = torch.LongTensor(bio_labels_raw).to(device)
+            bio_loss_fn       = nn.CrossEntropyLoss()
+            print(f"   ✅ Bio supervision ENABLED  — weight = {adaptive_bio_weight} ({n_query_classes} classes)")
     else:
         print("   ⚠️  No biological labels: Using unsupervised adaptation")
     
@@ -960,11 +1001,14 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
             # Loss 5: Adapter L2 regularisation (keeps adapter small)
             adapter_l2 = sum(p.pow(2).sum() for p in adapter.parameters())
             
-            # Combined loss
-            loss_total = (warmup_factor * loss_adversarial
-                          + 1.0 * loss_align
-                          + 5.0 * loss_bio
-                          + 0.1 * loss_recon
+            # Combined loss — alignment-first weighting
+            # adversarial : full weight (warmup already controls adapter via scale param)
+            # alignment   : 3× so MMD+CORAL+moment dominate over bio preservation
+            # bio         : adaptive weight (0.02–5.0 based on class count & overlap)
+            loss_total = (1.0  * loss_adversarial
+                          + 3.0  * loss_align
+                          + adaptive_bio_weight * loss_bio
+                          + 0.1  * loss_recon
                           + 1e-4 * adapter_l2)
             
             loss_total.backward()
