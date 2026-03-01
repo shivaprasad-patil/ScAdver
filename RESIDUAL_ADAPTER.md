@@ -158,7 +158,7 @@ Output: R(z)  ×  scale   (learnable scale parameter)
 Final: z' = z + scale * R(z)
 ```
 
-The final projection is **unbounded** (no Tanh) so the adapter can produce
+The final projection is **unbounded** so the adapter can produce
 residuals of any magnitude, fully bridging large domain shifts.
 Stability comes from LayerNorm in hidden layers and gradient clipping
 (`max_norm=1.0`) during training.
