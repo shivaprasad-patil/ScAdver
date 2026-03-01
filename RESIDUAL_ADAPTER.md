@@ -98,7 +98,6 @@ adata_query = transform_query_adaptive(
     adata_query=query_data,
     adata_reference=adata_reference[:500],  # Small reference sample
     bio_label='celltype',  # Optional: improves detection accuracy
-    adapter_dim='auto'  # Default - automatic detection via residual test
 )
 ```
 
@@ -144,22 +143,25 @@ adata_query = transform_query_adaptive(
 
 ## Implementation Details
 
-### Residual Adapter Network
+### Enhanced Residual Adapter Network
 ```python
 Input: z (latent embedding, dim=256)
     ↓
-Linear(256 → 128)
-LayerNorm
-GELU
-Dropout(0.1)
+Linear(256 → 128) → LayerNorm → GELU → Dropout(0.1)   # layer 1
     ↓
-Linear(128 → 256)
-Tanh  # Bounds residual
+Linear(128 → 128) → LayerNorm → GELU → Dropout(0.1)   # layer 2
     ↓
-Output: Δz (residual correction)
+Linear(128 → 256)                                       # unbounded projection
+    ↓
+Output: R(z)  ×  scale   (learnable scale parameter)
 
-Final: z' = z + Δz
+Final: z' = z + scale * R(z)
 ```
+
+The final projection is **unbounded** (no Tanh) so the adapter can produce
+residuals of any magnitude, fully bridging large domain shifts.
+Stability comes from LayerNorm in hidden layers and gradient clipping
+(`max_norm=1.0`) during training.
 
 ### Domain Discriminator
 ```python
@@ -207,21 +209,23 @@ for epoch in range(adaptation_epochs):
 ### Recommended Defaults
 ```python
 adapter_dim = 128          # Adapter hidden dimension
-adaptation_epochs = 50     # Training epochs
-learning_rate = 0.001      # Learning rate
+adaptation_epochs = 200    # Training epochs (with early stopping)
+learning_rate = 0.0005     # Peak learning rate (cosine-annealed)
+warmup_epochs = 50         # Warmup period
+patience = 30              # Early-stopping patience
 ```
 
 ### Tuning Guidelines
 
 **For larger domain shift:**
 - Increase `adapter_dim` to 256
-- Increase `adaptation_epochs` to 100
-- Lower `learning_rate` to 0.0005
+- Increase `adaptation_epochs` to 300+
+- Lower `learning_rate` to 0.0003
 
 **For faster adaptation:**
 - Decrease `adapter_dim` to 64
-- Decrease `adaptation_epochs` to 30
-- Increase `learning_rate` to 0.002
+- Decrease `adaptation_epochs` to 100
+- Increase `learning_rate` to 0.001
 
 **For better biological preservation:**
 - Provide `bio_label` (enables supervised loss)
@@ -236,6 +240,6 @@ learning_rate = 0.001      # Learning rate
 2. **Per-query training**: Each new domain with large shift needs separate adapter training
 3. **Hyperparameters**: May need tuning for optimal performance
 
-**Key Innovation**: The unified approach is self-adaptive—when adapter_dim>0 but domains are similar, the adapter automatically learns to output ≈0, making it equivalent to fast mode. This robustness eliminates the need to manually choose between methods.
+**Key Innovation**: The unified approach is self-adaptive — when domains are similar, the adapter automatically learns to output ≈ 0, making it equivalent to fast mode. This robustness eliminates the need to manually choose between methods.
 
 ---

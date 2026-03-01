@@ -176,23 +176,28 @@ class ResidualAdapter(nn.Module):
 
 class EnhancedResidualAdapter(nn.Module):
     """
-    Multi-layer residual adapter with skip connections, layer normalisation,
-    bounded outputs, and a learnable scaling parameter.
-    
+    Multi-layer residual adapter with layer normalisation and a learnable
+    scaling parameter.
+
     Architecture
     ------------
     z  ─┬─ Linear → LN → GELU → Dropout ─┐  (layer 1)
         │                                   │
         │  Linear → LN → GELU → Dropout ───┤  (layer 2)
         │                                   │
-        │  Linear → Tanh ──────────────────→ * scale
+        │  Linear ─────────────────────────→ * scale
         │                                   │
         └───────────────────────────────────+ → z'
-    
-    The Tanh bounds the raw residual to [-1, 1] and the learnable ``scale``
-    parameter (initialised small) controls the effective magnitude, allowing
-    the adapter to start near identity and grow as needed.
-    
+
+    The final projection is **unbounded** (no Tanh) so the adapter can
+    produce residuals of any magnitude, allowing it to fully bridge large
+    domain shifts.  Stability is provided by LayerNorm in the hidden layers
+    and gradient clipping (``max_norm=1.0``) during training.
+
+    The learnable ``scale`` parameter is initialised proportional to the
+    detected domain shift magnitude (≈ 0.8 × ||R||) so the adapter starts
+    covering ~80% of the shift at epoch 1 and grows freely from there.
+
     Parameters
     ----------
     latent_dim : int
@@ -205,6 +210,8 @@ class EnhancedResidualAdapter(nn.Module):
         Dropout probability (default 0.1).
     init_scale : float
         Initial value for the learnable scaling parameter (default 0.01).
+        In practice set to ``max(0.8 * residual_magnitude, 0.1)`` by
+        ``transform_query_adaptive``.
     seed : int or None
         If given, applies deterministic Xavier init.
     """
@@ -223,9 +230,8 @@ class EnhancedResidualAdapter(nn.Module):
             layers.append(nn.Dropout(dropout))
             in_dim = out_dim
         
-        # Final projection back to latent_dim with Tanh bound
+        # Final projection back to latent_dim
         layers.append(nn.Linear(in_dim, latent_dim))
-        layers.append(nn.Tanh())
         
         self.adapter = nn.Sequential(*layers)
         

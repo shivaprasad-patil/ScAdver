@@ -25,7 +25,7 @@ from .losses import (
     AlignmentLossComputer,
 )
 
-__version__ = "1.1.1"
+__version__ = "1.2.4"
 __author__ = "Shivaprasad Patil"
 __email__ = "shivaprasad309319@gmail.com"
 

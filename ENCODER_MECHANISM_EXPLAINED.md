@@ -449,27 +449,20 @@ adata_ref_corrected, model, metrics = adversarial_batch_correction(
 
 ### Projection Phase
 ```python
-# NO training happens here (fast mode, adapter_dim=0)!
+# Domain shift is auto-detected; adapter trained only when needed
 adata_query_corrected = transform_query_adaptive(
-    model=model,  # Frozen weights
-    adata_query=adata_query
-    # adapter_dim=0 by default - direct projection
+    model=model,              # Frozen encoder weights
+    adata_query=adata_query,
+    adata_reference=adata_ref[:500],  # Small reference sample for alignment
+    bio_label='celltype',     # Optional but recommended
 )
 
 # What happened:
-# 1. Query cells (5,000) pass through frozen encoder
-# 2. Each cell: X_query → [frozen_encoder] → Z_query
-# 3. Same transformation applied to each cell
-# 4. Batch effects automatically removed
-# 5. Biology automatically preserved
-# 6. Output: Z_query in same latent space as Z_ref
-
-# For large domain shifts, use adapter_dim>0:
-# adata_query_adapted = transform_query_adaptive(
-#     model, adata_query, 
-#     adata_reference=adata_ref[:500],
-#     adapter_dim=128  # Enables residual adapter training
-# )
+# 1. ScAdver trains a test adapter and measures ||R(z)||
+# 2. If R ≈ 0 → direct projection (no adaptation needed)
+# 3. If R > 0 → trains EnhancedResidualAdapter with adversarial +
+#    MMD + CORAL + moment-matching losses
+# 4. Output: z' = z + scale * R(z)  in same latent space as z_ref
 ```
 
 ### Result

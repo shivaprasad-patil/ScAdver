@@ -9,7 +9,7 @@ ScAdver eliminates technical batch effects from single-cell RNA-seq data while p
 - ✅ **Train once, project forever** — reuse the trained encoder across any number of query batches
 - 🔒 **Fully reproducible** — `set_global_seed()` seeds every random operation
 - 🎯 **Biology preserved** — adversarial discriminator removes batch effects without touching biological signal
-- 🏗️ **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, Tanh-bounded with learnable scale
+- 🏗️ **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, unbounded output with learnable scale
 - 📐 **Distribution alignment** — MMD + Moment-Matching + CORAL losses for robust domain adaptation
 - 🤖 **Automatic domain shift detection** — measures residual magnitude ‖R(z)‖ and decides whether an adapter is needed
 - 🖥️ **Multi-device** — CPU, CUDA, and Apple Silicon (MPS)
@@ -46,7 +46,7 @@ Split data into reference and query yourself, train on reference only, then proj
 
 **✅ Use when** query batches arrive over time, come from a different protocol, or you want to deploy a reusable model.
 
-→ See **[examples/pancreas_example.py](examples/pancreas_example.py)** (script) or **[examples/query_projection_notebook.ipynb](examples/query_projection_notebook.ipynb)** (notebook)
+→ See **[examples/query_projection_notebook.ipynb](examples/query_projection_notebook.ipynb)** for a complete walkthrough
 
 ---
 

@@ -57,7 +57,7 @@ def _resolve_device(device):
 
 def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=None, query_data=None, 
                                    latent_dim=256, epochs=500, learning_rate=0.001, 
-                                   bio_weight=20.0, batch_weight=0.5, device='auto', 
+                                   bio_weight='auto', batch_weight=0.5, device='auto', 
                                    return_reconstructed=False, seed=42):
     """
     Adversarial Batch Correction
@@ -83,8 +83,19 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         Number of training epochs
     learning_rate : float, default=0.001
         Learning rate for optimizers
-    bio_weight : float, default=20.0
-        Weight for biology preservation loss
+    bio_weight : float or 'auto', default='auto'
+        Weight for biology preservation loss.  When ``'auto'`` (default),
+        the weight is computed from the number of biology classes so that
+        the bio-loss gradient magnitude is balanced against the batch 
+        adversarial loss regardless of class count:
+        
+        * ≤ 20 classes  → 20.0  (strong supervision)
+        * ≤ 50 classes  → 15.0
+        * ≤ 100 classes → 8.0
+        * ≤ 500 classes → 3.0
+        * > 500 classes → 20 / log10(n_classes)^2  (e.g. ~1.66 for 2959)
+        
+        A float value is used directly without adjustment.
     batch_weight : float, default=0.5
         Weight for batch adversarial loss
     device : str, default='auto'
@@ -141,6 +152,39 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     print(f"   Biology labels: {len(np.unique(bio_labels))} unique")
     print(f"   Batch labels: {len(np.unique(batch_labels))} unique")
     
+    # ------------------------------------------------------------------
+    # Auto-scale bio_weight based on class count
+    # ------------------------------------------------------------------
+    n_bio_classes = len(np.unique(bio_labels))
+    
+    if bio_weight == 'auto':
+        if n_bio_classes <= 20:
+            effective_bio_weight = 20.0
+        elif n_bio_classes <= 50:
+            effective_bio_weight = 15.0
+        elif n_bio_classes <= 100:
+            effective_bio_weight = 8.0
+        elif n_bio_classes <= 500:
+            effective_bio_weight = 3.0
+        else:
+            # For very large class counts, scale inversely with log10(n)^2
+            # 2959 classes: 20 / (3.47)^2 ≈ 1.66
+            log_n = np.log10(n_bio_classes)
+            effective_bio_weight = 20.0 / (log_n ** 2)
+            effective_bio_weight = max(effective_bio_weight, 0.5)  # floor
+        
+        print(f"   ⚙️  bio_weight='auto' → {effective_bio_weight:.2f} (for {n_bio_classes} classes)")
+    else:
+        effective_bio_weight = float(bio_weight)
+        # Warn if user-supplied weight looks dangerously high for many classes
+        if n_bio_classes > 500 and effective_bio_weight > 5.0:
+            estimated_ce = np.log(n_bio_classes)
+            estimated_bio_grad = effective_bio_weight * estimated_ce
+            print(f"   ⚠️  bio_weight={effective_bio_weight:.1f} with {n_bio_classes} classes → "
+                  f"estimated bio gradient ≈ {estimated_bio_grad:.0f}×  "
+                  f"(may dominate batch correction; consider bio_weight='auto')")
+        print(f"   Bio weight: {effective_bio_weight}")
+    
     # Check for reference/query setup
     has_source_split = reference_data is not None and query_data is not None
     if has_source_split and 'Source' in adata_clean.obs.columns:
@@ -165,7 +209,6 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         
     else:
         source_labels = None
-        print(f"   Training on all provided data (global correction mode)")
         # Use all data for training when no reference-query split
         X_train = X
         bio_labels_train = bio_labels
@@ -218,7 +261,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     print(f"🏋️ TRAINING MODEL:")
     print(f"   Epochs: {epochs}")
     print(f"   Learning rate: {learning_rate}")
-    print(f"   Bio weight: {bio_weight}")
+    print(f"   Effective bio weight: {effective_bio_weight:.2f}")
     print(f"   Batch weight: {batch_weight}")
     if has_source_split:
         print(f"   🎯 Training ONLY on Reference samples: {X_train.shape[0]} samples")
@@ -230,8 +273,8 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     for epoch in range(epochs):
         model.train()
         
-        # Dynamic weight adjustment
-        epoch_bio_weight = bio_weight * (1 + 0.1 * (epoch / epochs))
+        # Dynamic weight adjustment — ramp gently from effective value
+        epoch_bio_weight = effective_bio_weight * (1 + 0.1 * (epoch / epochs))
         epoch_batch_weight = batch_weight * (1 + 0.5 * (epoch / epochs))
         
         for i in range(0, len(X_train), batch_size):
@@ -511,11 +554,22 @@ def detect_domain_shift(model, adata_query, adata_reference, bio_label=None, dev
     # Prepare biological labels if provided
     bio_loss_fn = None
     bio_labels_tensor = None
+    detect_bio_weight = 0.0
     if bio_label is not None and bio_label in adata_query.obs.columns:
         bio_encoder_local = LabelEncoder()
         bio_labels = bio_encoder_local.fit_transform(adata_query.obs.iloc[query_idx][bio_label])
         bio_labels_tensor = torch.LongTensor(bio_labels).to(device)
         bio_loss_fn = nn.CrossEntropyLoss()
+        n_det_classes = len(bio_encoder_local.classes_)
+        # Same adaptive scaling as main path
+        if n_det_classes <= 20:
+            detect_bio_weight = 5.0
+        elif n_det_classes <= 100:
+            detect_bio_weight = 1.0
+        elif n_det_classes <= 500:
+            detect_bio_weight = 0.2
+        else:
+            detect_bio_weight = 0.02
     
     # Quick training loop to test if adapter learns meaningful corrections
     batch_size = 128
@@ -579,7 +633,7 @@ def detect_domain_shift(model, adata_query, adata_reference, bio_label=None, dev
             loss_recon = nn.MSELoss()(recon_adapted, recon_orig)
             
             # Combined loss
-            loss_adapter = loss_adversarial + 5.0 * loss_bio + 0.1 * loss_recon
+            loss_adapter = loss_adversarial + detect_bio_weight * loss_bio + 0.1 * loss_recon
             loss_adapter.backward()
             torch.nn.utils.clip_grad_norm_(adapter.parameters(), max_norm=1.0)
             optimizer_adapter.step()
@@ -797,23 +851,33 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         latent_dim = z_sample.shape[1]
     
     # 4b. Instantiate adapter + discriminator with deterministic init
+    residual_mag = detection_result['residual_magnitude']
+    # Scale init_scale to cover the detected domain shift.
+    # The adapter output is unbounded, so the learnable scale
+    # parameter controls the initial correction magnitude.
+    # Start at 80% of the shift so the adapter can produce corrections of
+    # the right order from the start.  The scale grows freely during training.
+    init_scale = max(residual_mag * 0.8, 0.1)
+
     adapter = EnhancedResidualAdapter(
         latent_dim, adapter_dim, n_layers=3, dropout=0.1,
-        init_scale=0.01, seed=seed + 11,
+        init_scale=init_scale, seed=seed + 11,
     ).to(device)
     domain_disc = DomainDiscriminator(latent_dim, hidden_dim=256, dropout=0.3).to(device)
     initialize_weights_deterministically(domain_disc, seed=seed + 12)
     
     print(f"\n🏗️  Initializing enhanced residual adapter...")
-    print(f"   Architecture: {latent_dim} → [{adapter_dim}]*3 → {latent_dim}  (tanh-bounded, learnable scale)")
-    print(f"   Initial adapter scale: {adapter.effective_scale:.4f}")
+    print(f"   Architecture: {latent_dim} → [{adapter_dim}]*3 → {latent_dim}  (unbounded residual, learnable scale)")
+    print(f"   Domain shift magnitude : {residual_mag:.4f}")
+    print(f"   Adapter init_scale     : {init_scale:.4f}  (80% of shift)")
+    print(f"   Initial adapter scale  : {adapter.effective_scale:.4f}")
     
     # 4c. Optimisers with cosine annealing
     optimizer_adapter = optim.AdamW(
         adapter.parameters(), lr=learning_rate, weight_decay=1e-5, eps=1e-7,
     )
     optimizer_disc = optim.AdamW(
-        domain_disc.parameters(), lr=learning_rate * 0.5, weight_decay=1e-4, eps=1e-7,
+        domain_disc.parameters(), lr=learning_rate * 0.2, weight_decay=1e-4, eps=1e-7,
     )
     scheduler_adapter = optim.lr_scheduler.CosineAnnealingLR(
         optimizer_adapter, T_max=adaptation_epochs, eta_min=learning_rate * 0.01,
@@ -869,7 +933,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
             #   ≤20  classes → 5.0   (strong supervision)
             #   ≤100 classes → 1.0
             #   ≤500 classes → 0.2
-            #   >500 classes → 0.02  (e.g. 1680 perturbations)
+            #   >500 classes → 0.02  
             if n_query_classes <= 20:
                 adaptive_bio_weight = 5.0
             elif n_query_classes <= 100:
@@ -904,9 +968,53 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     print("   Losses: adversarial + MMD + CORAL + moment + bio + reconstruction")
     
     batch_size = 128
-    best_total_loss = float('inf')
-    best_adapter_state = None
+    # Early stopping: monitor discriminator accuracy.
+    # disc_acc → 0.5 means the discriminator can no longer tell ref from adapted
+    # query — the domains are aligned.  We save the state where disc_acc is
+    # CLOSEST to 0.5 (minimum |disc_acc - 0.5|).
+    best_disc_confusion = 0.0   # tracks max(1 - |disc_acc - 0.5| * 2)
+    best_adapter_state  = None
     epochs_without_improvement = 0
+    # Don't save best states until the discriminator has stabilised.
+    # Early epochs have artificially low disc_acc (disc still weak), which
+    # inflates disc_confusion and causes restoring near-untrained states.
+    save_grace = max(warmup_epochs // 2, 15)
+    
+    # Label smoothing for discriminator — prevents saturation at 0/1 which
+    # kills adversarial gradients to the adapter.
+    smooth_pos = 0.9   # "real" target  (instead of 1.0)
+    smooth_neg = 0.1   # "fake" target  (instead of 0.0)
+    
+    # ------------------------------------------------------------------
+    # 5a. Pre-train discriminator so it provides useful gradients from epoch 1
+    # ------------------------------------------------------------------
+    if z_ref_all is not None:
+        print("   🔧 Pre-training domain discriminator (10 steps)...")
+        domain_disc.train()
+        adapter.eval()
+        for _pre in range(10):
+            optimizer_disc.zero_grad()
+            g_pre = torch.Generator()
+            g_pre.manual_seed(seed + 500 + _pre)
+            pre_idx_q = torch.randperm(X_query_tensor.shape[0], generator=g_pre)[:batch_size]
+            pre_idx_r = torch.randint(0, z_ref_all.shape[0], (batch_size,), generator=g_pre)
+            with torch.no_grad():
+                z_q_pre = model.encoder(X_query_tensor[pre_idx_q])
+                z_q_pre = adapter(z_q_pre)
+                z_r_pre = z_ref_all[pre_idx_r]
+            pred_r = domain_disc(z_r_pre)
+            pred_q = domain_disc(z_q_pre)
+            lbl_r = torch.zeros(len(z_r_pre), dtype=torch.long, device=device)
+            lbl_q = torch.ones(len(z_q_pre), dtype=torch.long, device=device)
+            loss_pre = nn.CrossEntropyLoss()(pred_r, lbl_r) + nn.CrossEntropyLoss()(pred_q, lbl_q)
+            loss_pre.backward()
+            torch.nn.utils.clip_grad_norm_(domain_disc.parameters(), max_norm=1.0)
+            optimizer_disc.step()
+        print("   ✅ Discriminator pre-training complete")
+    
+    # ------------------------------------------------------------------
+    # 5b. Main training loop
+    # ------------------------------------------------------------------
     
     for epoch in range(adaptation_epochs):
         adapter.train()
@@ -922,23 +1030,27 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         indices = torch.randperm(n_total, generator=g)
         
         epoch_disc_loss = 0.0
+        epoch_disc_correct = 0.0
+        epoch_disc_total   = 0
         epoch_adapter_loss = 0.0
-        epoch_align_loss = 0.0
+        epoch_align_loss   = 0.0
         n_batches = 0
         
         for i in range(0, n_total, batch_size):
             batch_idx = indices[i:i + batch_size]
             X_batch = X_query_tensor[batch_idx]
             
-            # ---- Train Domain Discriminator ----
+            # ---- Train Domain Discriminator (fewer steps to avoid overwhelming adapter) ----
+            n_disc_steps = 2 if epoch < warmup_epochs else 1
             if z_ref_all is not None:
+              for _ds in range(n_disc_steps):
                 optimizer_disc.zero_grad()
                 
                 with torch.no_grad():
                     z_query = model.encoder(X_batch)
                     z_query_adapted = adapter(z_query)
                     g_ref = torch.Generator()
-                    g_ref.manual_seed(seed + 300 + epoch * 1000 + i)
+                    g_ref.manual_seed(seed + 300 + epoch * 1000 + i + _ds * 7)
                     ref_idx = torch.randint(
                         0, z_ref_all.shape[0], (len(batch_idx),), generator=g_ref,
                     )
@@ -946,14 +1058,31 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
                 
                 domain_pred_ref = domain_disc(z_ref_batch)
                 domain_pred_query = domain_disc(z_query_adapted)
-                lbl_ref = torch.zeros(len(z_ref_batch), dtype=torch.long, device=device)
-                lbl_query = torch.ones(len(z_query_adapted), dtype=torch.long, device=device)
-                loss_disc = (nn.CrossEntropyLoss()(domain_pred_ref, lbl_ref)
-                             + nn.CrossEntropyLoss()(domain_pred_query, lbl_query))
+                # Label smoothing: soft targets prevent disc saturation
+                n_r = len(z_ref_batch)
+                n_q = len(z_query_adapted)
+                lbl_ref_soft   = torch.full((n_r, 2), smooth_neg, device=device)
+                lbl_ref_soft[:, 0] = smooth_pos        # ref → class 0
+                lbl_query_soft = torch.full((n_q, 2), smooth_neg, device=device)
+                lbl_query_soft[:, 1] = smooth_pos      # query → class 1
+                # Soft cross-entropy via log_softmax
+                log_pred_r = torch.nn.functional.log_softmax(domain_pred_ref, dim=1)
+                log_pred_q = torch.nn.functional.log_softmax(domain_pred_query, dim=1)
+                loss_disc = -(lbl_ref_soft * log_pred_r).sum(1).mean() \
+                           - (lbl_query_soft * log_pred_q).sum(1).mean()
                 loss_disc.backward()
                 torch.nn.utils.clip_grad_norm_(domain_disc.parameters(), max_norm=1.0)
                 optimizer_disc.step()
                 epoch_disc_loss += loss_disc.item()
+                # Track accuracy (hard labels for monitoring)
+                with torch.no_grad():
+                    lbl_ref_hard   = torch.zeros(n_r, dtype=torch.long, device=device)
+                    lbl_query_hard = torch.ones(n_q, dtype=torch.long, device=device)
+                    pred_all = torch.cat([domain_pred_ref.argmax(1),
+                                          domain_pred_query.argmax(1)])
+                    lbl_all  = torch.cat([lbl_ref_hard, lbl_query_hard])
+                    epoch_disc_correct += (pred_all == lbl_all).sum().item()
+                    epoch_disc_total   += len(lbl_all)
             
             # ---- Train Adapter ----
             optimizer_adapter.zero_grad()
@@ -971,15 +1100,23 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
                 loss_adversarial = torch.tensor(0.0, device=device)
             
             # Loss 2: Distribution alignment (MMD + CORAL + moment)
+            # Use larger reference sample for stable kernel estimates
+            # (128 samples < 256 dims makes CORAL covariance rank-deficient)
             if z_ref_all is not None:
                 g_ref2 = torch.Generator()
                 g_ref2.manual_seed(seed + 400 + epoch * 1000 + i)
+                align_n = min(max(len(batch_idx) * 4, 512), z_ref_all.shape[0])
                 ref_idx2 = torch.randint(
-                    0, z_ref_all.shape[0], (len(batch_idx),), generator=g_ref2,
+                    0, z_ref_all.shape[0], (align_n,), generator=g_ref2,
                 )
                 z_ref_batch2 = z_ref_all[ref_idx2]
-                loss_align, align_comps = alignment_loss(z_ref_batch2, z_query_adapted)
-                loss_align = loss_align * warmup_factor
+                # Upsample query to match reference sample size for balanced estimates
+                if len(z_query_adapted) < align_n:
+                    repeats = (align_n // len(z_query_adapted)) + 1
+                    z_q_align = z_query_adapted.repeat(repeats, 1)[:align_n]
+                else:
+                    z_q_align = z_query_adapted[:align_n]
+                loss_align, align_comps = alignment_loss(z_ref_batch2, z_q_align)
                 epoch_align_loss += align_comps['total']
             else:
                 loss_align = torch.tensor(0.0, device=device)
@@ -1024,41 +1161,56 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         
         # ---- Logging & early stopping ----
         avg_adapter_loss = epoch_adapter_loss / max(n_batches, 1)
-        avg_disc_loss = epoch_disc_loss / max(n_batches, 1)
-        avg_align_loss = epoch_align_loss / max(n_batches, 1)
-        
-        improved = avg_adapter_loss < best_total_loss - 1e-4
-        if improved:
-            best_total_loss = avg_adapter_loss
-            best_adapter_state = {k: v.cpu().clone() for k, v in adapter.state_dict().items()}
+        avg_disc_loss    = epoch_disc_loss    / max(n_batches, 1)
+        avg_align_loss   = epoch_align_loss   / max(n_batches, 1)
+        # Discriminator accuracy: 1.0 = perfectly separates ref/query (bad)
+        #                          0.5 = completely confused (perfect alignment)
+        disc_acc = epoch_disc_correct / max(epoch_disc_total, 1)
+        # Confusion score: 1.0 when disc_acc=0.5, 0.0 when disc_acc=0 or 1
+        disc_confusion = 1.0 - abs(disc_acc - 0.5) * 2.0
+
+        # Save when discriminator is most confused (domains most aligned).
+        # Don't save during the grace period — disc_acc is artificially low
+        # before the discriminator has stabilised, which inflates confusion.
+        improved = disc_confusion > best_disc_confusion + 1e-4
+        can_save = epoch >= save_grace
+        if improved and can_save:
+            best_disc_confusion = disc_confusion
+            best_adapter_state  = {k: v.cpu().clone() for k, v in adapter.state_dict().items()}
             epochs_without_improvement = 0
-        else:
+        elif can_save:
             epochs_without_improvement += 1
-        
+        # During grace period: neither save nor count toward patience
+
         if (epoch + 1) % 10 == 0 or epoch == 0:
             lr_now = scheduler_adapter.get_last_lr()[0]
             print(
                 f"   Epoch {epoch + 1:>3d}/{adaptation_epochs} | "
                 f"Adapter: {avg_adapter_loss:.4f} | "
                 f"Disc: {avg_disc_loss:.4f} | "
+                f"DiscAcc: {disc_acc:.3f} | "
                 f"Align: {avg_align_loss:.4f} | "
                 f"Scale: {adapter.effective_scale:.4f} | "
-                f"LR: {lr_now:.6f} | "
-                f"Warmup: {warmup_factor:.2f}"
-                + ("  💾 best" if improved else "")
+                f"LR: {lr_now:.6f}"
+                + ("  💾 best" if (improved and can_save) else "")
             )
-        
-        if epochs_without_improvement >= patience and epoch >= warmup_epochs:
-            print(f"   ⏹  Early stopping at epoch {epoch + 1} (no improvement for {patience} epochs)")
+
+        # Only allow early stopping after warmup + 10 grace epochs.
+        # Stop when discriminator is persistently confused — domains are aligned.
+        early_stop_eligible = epoch >= (warmup_epochs + 10)
+        if epochs_without_improvement >= patience and early_stop_eligible:
+            print(f"   ⏹  Early stopping at epoch {epoch + 1} "
+                  f"(disc accuracy stable at {disc_acc:.3f} for {patience} epochs)")
             break
-    
-    # Restore best adapter
+
+    # Restore best adapter (state where discriminator was most confused)
     if best_adapter_state is not None:
         adapter.load_state_dict({k: v.to(device) for k, v in best_adapter_state.items()})
-        print(f"✅ Adaptation complete! Best loss: {best_total_loss:.4f}")
+        print(f"✅ Adaptation complete! Best disc confusion: {best_disc_confusion:.4f} "
+              f"(disc acc ≈ {0.5 + (1 - best_disc_confusion) / 2:.3f})")
         print(f"   🔄 Restored adapter from best epoch")
     else:
-        print(f"✅ Adaptation complete! Final loss: {avg_adapter_loss:.4f}")
+        print(f"✅ Adaptation complete! Final disc acc: {disc_acc:.3f}")
     
     print(f"   Final adapter scale: {adapter.effective_scale:.4f}")
     
