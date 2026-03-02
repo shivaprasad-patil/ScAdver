@@ -1,245 +1,194 @@
-# Residual Adapter for Domain Adaptation
+# Query Projection with ScAdver — Residual Adapter & Analytical Path
 
 ## Overview
 
-ScAdver uses **fully automatic query projection** that intelligently adapts to domain shifts:
+`transform_query_adaptive` projects query data into a pre-trained reference latent space. It **automatically selects one of two paths** based on the number of biological classes in the reference:
 
-### How It Works
-1. **Automatic Detection**: Trains a test residual adapter and measures ||R(z)||
-2. **Simple Decision**: 
-   - If R ≈ 0 → Domains are similar, uses fast direct projection
-   - If R > 0 → Domain shift detected, trains residual adapter
-3. **No Manual Tuning**: System decides the best approach automatically
+| Condition | Path | What runs |
+|-----------|------|-----------|
+| **≤ 100 classes** | Neural adapter | `EnhancedResidualAdapter` with adversarial + alignment losses |
+| **> 100 classes** | Analytical mean-shift | Per-class centroid correction — no training, seconds to complete |
 
-### Two Modes (Automatically Selected)
-
-**Fast Mode (when R ≈ 0)**:
-- **Approach**: Direct projection through frozen encoder
-- **When used**: Similar protocols, no domain shift detected
-- **Output**: `z = encoder(x)`
-
-**Adaptive Mode (when R > 0)**:
-- **Approach**: Trains lightweight residual adapter
-- **When used**: Domain shift detected (e.g., 10X → Smart-seq2)
-- **Output**: `z' = encoder(x) + adapter(encoder(x))`
+The routing is fully automatic — no parameters to set.
 
 ---
 
-## How Residual Adapters Work
+## Path A — Neural Adapter (≤ 100 classes)
+
+### When it activates
+
+Cross-technology datasets with few cell types (e.g. pancreas with 14 cell types across 9 technologies). The domain shift is **non-linear** — a neural adapter is needed to bridge different sequencing protocols.
 
 ### Architecture
 
 ```
-Reference data (unchanged):
-    x_ref → E(x_ref) → z_ref
-
 Query data (adapted):
-    x_query → E(x_query) → z → z' = z + R(z)
-    
+    x_query → frozen_encoder → z → z' = z + scale * R(z)
+
 Where:
-    E = Frozen reference encoder
-    R = Trainable residual adapter (small network)
-    z' = Adapted embedding
+    frozen_encoder = Stage-1 reference encoder (weights fixed)
+    R              = EnhancedResidualAdapter (trainable, ~200K params)
+    scale          = learnable scalar, initialised small (≈ 0.05)
+    z'             = adapted embedding
 ```
 
 ### Training Objectives
 
-The adapter `R` is trained with three objectives:
-
-1. **Domain Alignment (Adversarial)**
-   ```
-   Discriminator D: tries to distinguish reference vs query
-   Adapter R: tries to fool D (make query look like reference)
-   
-   Loss: -CrossEntropy(D(z'), label=reference)
-   ```
-
-2. **Biological Preservation**
-   ```
-   If biological labels available on query:
-   Loss: CrossEntropy(BioClassifier(z'), true_labels)
-   
-   Ensures adapted embeddings preserve cell types
-   ```
-
-3. **Information Preservation**
-   ```
-   Loss: MSE(Decoder(z'), Decoder(z))
-   
-   Ensures adapter doesn't lose information
-   ```
-
-### Key Insight
-
-By keeping the encoder `E` frozen and only training `R`:
-- ✅ Reference embeddings unchanged
-- ✅ No catastrophic forgetting
-- ✅ Adapter learns query-specific corrections
-- ✅ Only ~100K-500K parameters updated (vs ~6M in full encoder)
-
----
-
-## Automatic Domain Shift Detection
-
-ScAdver now automatically detects domain shifts using **residual magnitude analysis**!
-
-ScAdver directly tests if adaptation is needed by:
-1. **Training a test residual adapter** in adaptive mode for ~30 epochs
-2. **Measuring the residual magnitude**: ||R(z)|| across all query samples
-3. **Making a decision**:
-   - If R ≈ 0 → No domain shift, use direct projection
-   - If R > 0 → Domain shift exists, use residual adapter
-
-
 ```python
-# Let ScAdver decide automatically (recommended)
-adata_query = transform_query_adaptive(
-    model=model,
-    adata_query=query_data,
-    adata_reference=adata_reference[:500],  # Small reference sample
-    bio_label='celltype',  # Optional: improves detection accuracy
+# Per batch:
+loss_adapter = (
+    5.0  * adversarial_loss(D(z'), label=reference)   # Fool discriminator
+  + 5.0  * alignment(z_ref, z')                        # MMD + CORAL + Moments
+  + 10.0 * conditional_mmd(z_ref, z', cell_type)       # Per-cell-type alignment
+  + w_bio * bio_cross_entropy(BioClassifier(z'), y)     # Biology preservation
+  + 0.05 * recon_mse(Decoder(z'), Decoder(z))           # Information preservation
 )
+
+loss_disc = cross_entropy(D(z_ref), ref) + cross_entropy(D(z'), query)
 ```
 
-**Simple Decision Rule:**
-- **||R|| ≈ 0** (< 0.1): No domain shift → Direct projection
-- **||R|| > 0** (≥ 0.1): Domain shift detected → Use residual adapter
+`w_bio` scales automatically with class count and label overlap:
 
-The threshold of 0.1 accounts for numerical noise while keeping the decision simple and automatic.
+| Classes | w_bio |
+|---------|-------|
+| ≤ 20 | 5.0 |
+| ≤ 100 | 1.0 |
+| > 100 | N/A (analytical path) |
+| overlap < 30% | 0.0 (disabled — noisy gradients) |
+
+### Training Details
+
+- **Discriminator**: 2 update steps per adapter step; soft targets (0.9/0.1) to prevent saturation
+- **LR schedule**: `CosineAnnealingWarmRestarts` with warmup ramp
+- **Early stopping**: Patience on |disc_acc − 0.5| — stops when discriminator is maximally confused
+- **Best-state checkpoint**: Returns adapter weights from the epoch with disc_acc closest to 0.5
+
+### Default Hyperparameters
+
+```python
+adaptation_epochs = 300    # max training epochs
+warmup_epochs     = 20     # LR ramp-up period
+patience          = 50     # early-stopping patience
+max_epochs        = 800    # hard cap
+learning_rate     = 0.001
+adapter_dim       = 128    # hidden dim inside adapter
+```
+
+### Validated performance
+
+Pancreas dataset (14 cell types, 9 technologies):
+- **LTA** = 0.972 ✅
+- **Tech mixing** ≥ 90% of reference ceiling ✅
 
 ---
 
-## Usage Example
+## Path B — Analytical Mean-Shift (> 100 classes)
 
-ScAdver now has **one unified automatic mode** that handles everything:
+### When it activates
+
+Large perturbation screens where the reference and query share a **common biological label** (e.g. perturbation name) across many classes (hundreds to thousands). Neural training fails at this scale — per-class statistics give a more accurate and far faster correction.
+
+### Algorithm
+
+**Step 1 — Encode query with frozen encoder (no gradient)**
+```python
+z_query = encoder(x_query)   # inference only
+z_ref   = ref_embeddings      # already computed at Stage-1
+```
+
+**Step 2 — Compute global fallback shift**
+```python
+global_shift = z_ref.mean(axis=0) - z_query.mean(axis=0)
+```
+
+**Step 3 — Per-class centroid correction**
+
+For each class `c` present in the query:
+
+```python
+if c in ref_classes and n_query_cells(c) >= 3:
+    shift_c = mean(z_ref[c]) - mean(z_query[c])
+    z_corrected[query_mask_c] = z_query[query_mask_c] + shift_c
+else:
+    # Orphan or too few cells → global fallback
+    z_corrected[query_mask_c] = z_query[query_mask_c] + global_shift
+```
+
+**Zero-overlap guard**
+
+If **no query class** has a reference counterpart, a `UserWarning` is raised and **all** query cells receive the global mean shift:
+
+```
+UserWarning: "Zero perturbation class overlap between query and reference —
+no per-class centroid alignment possible. Falling back to global mean shift
+for ALL query cells. Source mixing may be reduced; LTA is not meaningful."
+```
+
+### Properties
+
+| Property | Value |
+|----------|-------|
+| Training epochs | 0 |
+| Runtime (100k cells) | ~7 seconds |
+| Per-class correction | ✅ (matched classes) |
+| Orphan fallback | Global mean shift |
+| LTA meaningful? | Only for matched classes |
+
+---
+
+## Usage
 
 ```python
 from scadver import adversarial_batch_correction, transform_query_adaptive
 
-# Train once on reference
-adata_ref, model, metrics = adversarial_batch_correction(
+# Stage 1 — train encoder on reference
+adata_ref_corrected, model, metrics = adversarial_batch_correction(
     adata=adata_reference,
-    bio_label='celltype',
+    bio_label='celltype',      # or 'perturbation' for screens
     batch_label='tech',
-    epochs=500
+    epochs=500,
 )
 
-# Project query data - fully automatic!
-# ScAdver detects domain shift and chooses the best approach
-adata_query = transform_query_adaptive(
+# Stage 2 — project query (path chosen automatically)
+adata_query_corrected = transform_query_adaptive(
     model=model,
-    adata_query=query_data,
-    adata_reference=adata_reference[:500],  # Small reference sample
-    bio_label='celltype'  # Optional but recommended
+    adata_query=adata_query,
+    adata_reference=adata_reference,
+    bio_label='celltype',      # determines routing: ≤100 → neural, >100 → analytical
+    adaptation_epochs=300,
+    warmup_epochs=20,
+    patience=50,
+    max_epochs=800,
+    learning_rate=0.001,
+    device='auto',
+    seed=42,
 )
 
-# That's it! No manual tuning needed.
-# System automatically decides:
-# - If R ≈ 0: Uses fast direct projection
-# - If R > 0: Trains and applies residual adapter
+# Result
+adata_query_corrected.obsm['X_ScAdver']   # batch-corrected latent embeddings
 ```
-
----
-
-## Implementation Details
-
-### Enhanced Residual Adapter Network
-```python
-Input: z (latent embedding, dim=256)
-    ↓
-Linear(256 → 128) → LayerNorm → GELU → Dropout(0.1)   # layer 1
-    ↓
-Linear(128 → 128) → LayerNorm → GELU → Dropout(0.1)   # layer 2
-    ↓
-Linear(128 → 256)                                       # unbounded projection
-    ↓
-Output: R(z)  ×  scale   (learnable scale parameter)
-
-Final: z' = z + scale * R(z)
-```
-
-The final projection is **unbounded** so the adapter can produce
-residuals of any magnitude, fully bridging large domain shifts.
-Stability comes from LayerNorm in hidden layers and gradient clipping
-(`max_norm=1.0`) during training.
-
-### Domain Discriminator
-```python
-Input: z' (adapted embedding)
-    ↓
-Linear(256 → 256)
-BatchNorm
-LeakyReLU
-Dropout(0.3)
-    ↓
-Linear(256 → 128)
-BatchNorm
-LeakyReLU
-Dropout(0.3)
-    ↓
-Linear(128 → 2)  # Binary: ref vs query
-    ↓
-Output: P(reference | z')
-```
-
-### Training Loop
-```python
-for epoch in range(adaptation_epochs):
-    # Train discriminator
-    loss_D = CE(D(z_ref), 0) + CE(D(z'_query), 1)
-    
-    # Train adapter (adversarial + alignment + bio + recon)
-    loss_R = (1.0  * CE(D(z'_query), label=ref)          # Fool discriminator
-            + 3.0  * Align(z_ref, z'_query)               # MMD + CORAL + moments
-            + w_bio * CE(Bio(z'_query), y)                # Preserve biology (adaptive)
-            + 0.1  * MSE(Dec(z'), Dec(z)))                # Preserve info
-
-# w_bio is adaptive based on number of bio classes and class overlap:
-#   ≤ 20  classes → 5.0   (strong supervision)
-#   ≤ 100 classes → 1.0
-#   ≤ 500 classes → 0.2
-#   > 500 classes → 0.02  (alignment dominates)
-#   overlap < 30% → 0.0   (bio supervision disabled — noisy gradients)
-```
-
----
-
-## Hyperparameters
-
-### Recommended Defaults
-```python
-adapter_dim = 128          # Adapter hidden dimension
-adaptation_epochs = 200    # Training epochs (with early stopping)
-learning_rate = 0.0005     # Peak learning rate (cosine-annealed)
-warmup_epochs = 50         # Warmup period
-patience = 30              # Early-stopping patience
-```
-
-### Tuning Guidelines
-
-**For larger domain shift:**
-- Increase `adapter_dim` to 256
-- Increase `adaptation_epochs` to 300+
-- Lower `learning_rate` to 0.0003
-
-**For faster adaptation:**
-- Decrease `adapter_dim` to 64
-- Decrease `adaptation_epochs` to 100
-- Increase `learning_rate` to 0.001
-
-**For better biological preservation:**
-- Provide `bio_label` (enables supervised loss)
-- Bio loss weight is automatically scaled by class count (5.0 for ≤20 classes, 0.02 for >500 classes)
-- If class overlap between query and reference is <30%, bio supervision is disabled automatically to avoid noisy gradients
 
 ---
 
 ## Limitations
 
-1. **Requires reference sample**: Adaptive mode needs small reference subset for alignment
-2. **Per-query training**: Each new domain with large shift needs separate adapter training
-3. **Hyperparameters**: May need tuning for optimal performance
+| | Neural path | Analytical path |
+|-|-------------|-----------------|
+| Classes | ≤ 100 | > 100 |
+| Requires bio_label | Optional (improves results) | Required (used for centroid grouping) |
+| Non-linear shift | ✅ Handled | ❌ Assumes translational shift per class |
+| Zero overlap | Falls back to direct projection | Falls back to global mean shift (warns) |
+| Orphan query classes | Aligned via distribution loss | Global mean shift |
+| Runtime | Minutes | Seconds |
 
-**Key Innovation**: The unified approach is self-adaptive — when domains are similar, the adapter automatically learns to output ≈ 0, making it equivalent to fast mode. This robustness eliminates the need to manually choose between methods.
+---
+
+## Removed in v1.7.3
+
+The following approach from earlier versions has been **removed**:
+
+> ~~Automatic detection: trains a probe adapter for ~30 epochs and measures ‖R(z)‖ to decide whether adaptation is needed~~
+
+This was replaced by the class-count routing above, which is simpler, faster, and empirically more accurate.
 
 ---

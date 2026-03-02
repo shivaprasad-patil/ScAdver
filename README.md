@@ -9,9 +9,10 @@ ScAdver eliminates technical batch effects from single-cell RNA-seq data while p
 - ✅ **Train once, project forever** — reuse the trained encoder across any number of query batches
 - 🔒 **Fully reproducible** — `set_global_seed()` seeds every random operation
 - 🎯 **Biology preserved** — adversarial discriminator removes batch effects without touching biological signal
-- 🏗️ **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, unbounded output with learnable scale
+- 🏗️ **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, unbounded output with learnable scale (≤100 classes)
 - 📐 **Distribution alignment** — MMD + Moment-Matching + CORAL losses for robust domain adaptation
-- 🤖 **Automatic domain shift detection** — measures residual magnitude ‖R(z)‖ and decides whether an adapter is needed
+- 🔀 **Two-path query projection** — neural adapter for cross-technology datasets (≤100 cell types); analytical per-class mean-shift for large perturbation screens (>100 classes)
+- 🚀 **Zero-training large-scale mode** — analytical path corrects 100k+ cells in seconds with no epochs
 - 🖥️ **Multi-device** — CPU, CUDA, and Apple Silicon (MPS)
 
 ## Installation
@@ -73,7 +74,12 @@ The encoder is trained adversarially:
 - A **bio-classifier** pushes the encoder to retain cell-type signal
 - A **batch discriminator** pushes the encoder to discard technical batch signal
 
-For cross-protocol queries, `transform_query_adaptive` trains an `EnhancedResidualAdapter` on top of the frozen encoder, minimising adversarial + MMD + CORAL + moment-matching + biology losses with warmup scheduling and early stopping.
+`transform_query_adaptive` automatically routes to one of two paths based on class count:
+
+| Classes | Path | Method |
+|---------|------|--------|
+| ≤ 100 | **Neural adapter** | `EnhancedResidualAdapter` — adversarial + MMD + CORAL + conditional alignment losses, warmup LR, early stopping |
+| > 100 | **Analytical** | Per-class mean-shift: `z' = z_query + (mean(z_ref_c) − mean(z_query_c))` — no training, completes in seconds |
 
 Full technical details: [ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md) · [RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)
 

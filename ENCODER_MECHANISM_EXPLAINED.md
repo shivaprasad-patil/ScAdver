@@ -449,7 +449,7 @@ adata_ref_corrected, model, metrics = adversarial_batch_correction(
 
 ### Projection Phase
 ```python
-# Domain shift is auto-detected; adapter trained only when needed
+# Path auto-selected by class count (≤100 → neural, >100 → analytical)
 adata_query_corrected = transform_query_adaptive(
     model=model,              # Frozen encoder weights
     adata_query=adata_query,
@@ -457,12 +457,13 @@ adata_query_corrected = transform_query_adaptive(
     bio_label='celltype',     # Optional but recommended
 )
 
-# What happened:
-# 1. ScAdver trains a test adapter and measures ||R(z)||
-# 2. If R ≈ 0 → direct projection (no adaptation needed)
-# 3. If R > 0 → trains EnhancedResidualAdapter with adversarial +
+# What happened (v1.7.3 two-path routing):
+# 1. ScAdver counts distinct biological classes in the reference
+# 2. If classes ≤ 100 → trains EnhancedResidualAdapter with adversarial +
 #    MMD + CORAL + moment-matching losses
-# 4. Output: z' = z + scale * R(z)  in same latent space as z_ref
+#    Output: z' = z + scale * R(z)  in same latent space as z_ref
+# 3. If classes > 100 → analytical per-class mean-shift, no training
+#    Output: z' = z + (centroid_ref_class - centroid_query_class)
 ```
 
 ### Result

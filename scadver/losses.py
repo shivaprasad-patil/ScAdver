@@ -185,3 +185,70 @@ class AlignmentLossComputer(nn.Module):
             'total': total.item(),
         }
         return total, components
+
+
+class SlicedWassersteinLoss(nn.Module):
+    """
+    Sliced Wasserstein Distance (SWD) between two distributions.
+
+    Projects both distributions onto ``n_projections`` random 1D directions
+    and computes the average 1D Wasserstein distance (L1 distance between
+    sorted projections).
+
+    Why SWD over MMD/CORAL in high dimensions
+    -----------------------------------------
+    MMD with fixed-bandwidth RBF kernels becomes nearly constant in high
+    dimensions (bandwidth must match the data scale; typical single-cell
+    embeddings span different scales across runs).  SWD avoids this by
+    working in 1D projections where sorting gives an exact, unbiased
+    estimate of the 1D Wasserstein distance, regardless of dimensionality.
+
+    SWD is particularly effective when the domain shift contains a complex
+    rotational or structural component that moment matching misses.
+
+    Parameters
+    ----------
+    n_projections : int
+        Number of random 1D projections (default 50).  Higher = more
+        accurate but slower.  50 is a good balance for 256-d spaces.
+    """
+
+    def __init__(self, n_projections: int = 50):
+        super().__init__()
+        self.n_projections = n_projections
+
+    def forward(self, source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        source : Tensor (n, d) — reference embeddings
+        target : Tensor (m, d) — query (adapted) embeddings
+
+        Both tensors are sub-sampled to ``min(n, m)`` before sorting so
+        that the 1D empirical distributions are on equal support.
+
+        Returns
+        -------
+        swd : scalar Tensor — average 1D Wasserstein distance (≥ 0)
+        """
+        d = source.shape[1]
+
+        # Random unit projections
+        proj = torch.randn(self.n_projections, d, device=source.device,
+                           dtype=source.dtype)
+        proj = proj / proj.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+        # Project onto each direction  →  (n/m, n_projections)
+        src_proj = source @ proj.T
+        tgt_proj = target @ proj.T
+
+        # Equalise sample sizes (take first n rows; caller should shuffle)
+        n = min(src_proj.shape[0], tgt_proj.shape[0])
+        src_proj = src_proj[:n]
+        tgt_proj = tgt_proj[:n]
+
+        # 1D Wasserstein = mean abs diff of sorted empirical CDFs
+        src_sorted = src_proj.sort(dim=0).values
+        tgt_sorted = tgt_proj.sort(dim=0).values
+
+        return (src_sorted - tgt_sorted).abs().mean()

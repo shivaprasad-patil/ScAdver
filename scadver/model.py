@@ -176,11 +176,12 @@ class ResidualAdapter(nn.Module):
 
 class EnhancedResidualAdapter(nn.Module):
     """
-    Multi-layer residual adapter with layer normalisation and a learnable
-    scaling parameter.
+    Multi-layer residual adapter with layer normalisation, a learnable
+    scaling parameter, and an optional **global shift** for large-scale
+    domain adaptation.
 
-    Architecture
-    ------------
+    Architecture (standard mode)
+    ----------------------------
     z  ─┬─ Linear → LN → GELU → Dropout ─┐  (layer 1)
         │                                   │
         │  Linear → LN → GELU → Dropout ───┤  (layer 2)
@@ -189,14 +190,19 @@ class EnhancedResidualAdapter(nn.Module):
         │                                   │
         └───────────────────────────────────+ → z'
 
-    The final projection is **unbounded** (no Tanh) so the adapter can
-    produce residuals of any magnitude, allowing it to fully bridge large
-    domain shifts.  Stability is provided by LayerNorm in the hidden layers
-    and gradient clipping (``max_norm=1.0``) during training.
+    Architecture (large-scale / mean-shift mode)
+    --------------------------------------------
+    z  ─┬─ Linear → LN → GELU → Dropout ─┐  (layer 1)
+        │  Linear → LN → GELU → Dropout ───┤  (layer 2)
+        │  Linear ─────────────────────────→ * scale
+        │                                   │
+        └─────────────────── + global_shift + → z'
 
-    The learnable ``scale`` parameter is initialised proportional to the
-    detected domain shift magnitude (≈ 0.8 × ||R||) so the adapter starts
-    covering ~80% of the shift at epoch 1 and grows freely from there.
+    ``global_shift`` is a trainable 256-d vector initialised to
+    ``mean(z_ref) - mean(z_query)``.  From epoch 1 the bulk of the
+    domain translation is already applied; the network only needs to
+    learn per-cell refinements.  This dramatically accelerates
+    convergence when the domain shift is primarily translational.
 
     Parameters
     ----------
@@ -212,12 +218,16 @@ class EnhancedResidualAdapter(nn.Module):
         Initial value for the learnable scaling parameter (default 0.01).
         In practice set to ``max(0.8 * residual_magnitude, 0.1)`` by
         ``transform_query_adaptive``.
+    mean_shift : Tensor (latent_dim,) or None
+        If given, a trainable global translation vector initialised to
+        this value.  Use ``mean(z_ref) - mean(z_query)`` so the adapter
+        starts with the inter-domain mean offset already applied.
     seed : int or None
         If given, applies deterministic Xavier init.
     """
     
     def __init__(self, latent_dim, adapter_dim=128, n_layers=3, dropout=0.1,
-                 init_scale=0.01, seed=None):
+                 init_scale=0.01, mean_shift=None, seed=None):
         super().__init__()
         
         layers = []
@@ -235,20 +245,33 @@ class EnhancedResidualAdapter(nn.Module):
         
         self.adapter = nn.Sequential(*layers)
         
-        # Skip-connection projection (for when adapter_dim != latent_dim at intermediate layers)
-        # This is simply the identity; the skip is z itself.
-        
         # Learnable scaling — starts small so the adapter is near-identity
         self.scale = nn.Parameter(torch.tensor(init_scale))
+
+        # Optional global shift (large-scale mode).
+        # Initialised to the inter-domain mean offset so the adapter
+        # starts with the bulk of the translation already applied.
+        if mean_shift is not None:
+            self.global_shift = nn.Parameter(mean_shift.clone().float())
+        else:
+            self.global_shift = None
         
-        # Deterministic init
+        # Deterministic init (applied to all params; global_shift is set
+        # AFTER this so it keeps its initialised value)
         if seed is not None:
             initialize_weights_deterministically(self, seed=seed, gain=0.01)
+        # Re-apply global_shift after deterministic init overwrites it
+        if mean_shift is not None:
+            with torch.no_grad():
+                self.global_shift.copy_(mean_shift.clone().float())
     
     def forward(self, z):
-        """z' = z + scale * adapter(z)"""
+        """z' = z + global_shift (if set) + scale * adapter(z)"""
         residual = self.adapter(z)
-        return z + self.scale * residual
+        out = z + self.scale * residual
+        if self.global_shift is not None:
+            out = out + self.global_shift.unsqueeze(0)
+        return out
     
     @property
     def effective_scale(self):
