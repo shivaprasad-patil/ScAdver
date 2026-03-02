@@ -895,39 +895,58 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     set_global_seed(seed)
     
     # ------------------------------------------------------------------
-    # 1. Path pre-selection & domain-shift probe
-    # For >100 classes the analytical mean-shift path will be taken later
-    # (section 5); the probe here determines adapter_dim for the neural path.
+    # 1. Path pre-selection & optional domain-shift probe
     # ------------------------------------------------------------------
-    print("🤖 AUTO-DETECTING DOMAIN SHIFT...")
+    # Early class-count check — determines whether to run the probe at all.
+    # For >100 classes we go straight to the analytical path; the probe
+    # wastes ~30 training epochs and its result is discarded anyway.
+    _n_ct_precheck = 0
+    if (bio_label is not None and adata_reference is not None
+            and bio_label in adata_reference.obs.columns):
+        _n_ct_precheck = len(adata_reference.obs[bio_label].unique())
+    _skip_probe = _n_ct_precheck > 100
+
+    print("🤖 PATH SELECTION...")
     print("=" * 50)
-    print("   Probe: short residual adapter run to estimate shift magnitude & adapter dim")
-    detection_result = detect_domain_shift(
-        model, adata_query, adata_reference,
-        bio_label=bio_label, device=device, seed=seed,
-    )
-    
-    adapter_dim = detection_result['adapter_dim']
-    
-    print(f"   📊 Residual Probe Analysis:")
-    print(f"      Residual Magnitude (||R||): {detection_result['residual_magnitude']:.4f}")
-    print(f"      Residual Std Dev: {detection_result['residual_std']:.4f}")
-    print(f"   🎯 Raw decision: {'ADAPTER NEEDED' if detection_result['needs_adapter'] else 'DIRECT PROJECTION'}")
-    print(f"      Confidence: {detection_result['confidence'].upper()}")
-    print(f"   (Final path is determined by class count after data prep — see section 5)")
-    
-    if detection_result['needs_adapter']:
-        print(f"   💡 Residual R > 0: Domain shift detected — using adapter")
+
+    if _skip_probe:
+        # Analytical path: no probe needed, fix adapter_dim to 128 so the
+        # rest of the setup code runs normally before branching at section 5.
+        print(f"   {_n_ct_precheck} classes > 100 → analytical mean-shift path")
+        print(f"   Skipping residual probe (not used for large-scale datasets)")
+        adapter_dim = 128          # ensures use_adapter=True; overridden at section 5
+        detection_result = {
+            'needs_adapter': True,
+            'adapter_dim': 128,
+            'residual_magnitude': float('nan'),
+            'residual_std': float('nan'),
+            'confidence': 'n/a',
+        }
     else:
-        print(f"   ✅ Residual R ≈ 0: Domains are similar — using direct projection")
+        print(f"   {_n_ct_precheck} classes ≤ 100 → running residual probe to check shift magnitude")
+        print(f"   Probe: short adapter run (~30 epochs) on {min(1000, adata_query.shape[0])} samples")
+        detection_result = detect_domain_shift(
+            model, adata_query, adata_reference,
+            bio_label=bio_label, device=device, seed=seed,
+        )
+        adapter_dim = detection_result['adapter_dim']
+        print(f"   📊 Residual Probe Analysis:")
+        print(f"      ||R(z)||: {detection_result['residual_magnitude']:.4f}  "
+              f"(std {detection_result['residual_std']:.4f})")
+        print(f"   🎯 Decision: {'ADAPTER NEEDED' if detection_result['needs_adapter'] else 'DIRECT PROJECTION — shift negligible'}")
+        print(f"      Confidence: {detection_result['confidence'].upper()}")
+        if detection_result['needs_adapter']:
+            print(f"   💡 ||R|| > 0.1: domain shift detected — training neural adapter")
+        else:
+            print(f"   ✅ ||R|| ≈ 0: domains already aligned — using frozen encoder directly")
     print()
-    
+
     use_adapter = adapter_dim > 0
-    
+
     if use_adapter:
         print("\n🔬 ADAPTIVE QUERY PROJECTION (Enhanced)")
     else:
-        print("\n🚀 FAST DIRECT PROJECTION")
+        print("\n🚀 FAST DIRECT PROJECTION (frozen encoder only)")
     print("=" * 50)
     
     # ------------------------------------------------------------------
@@ -988,13 +1007,9 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     
     # 4b. Instantiate adapter + discriminator with deterministic init
     residual_mag = detection_result['residual_magnitude']
-    # Early class-count estimation — needed for architecture decisions
-    # (disc hidden dim, batch size, init_scale) BEFORE those objects are created.
-    _n_ct_early = 0
-    if (bio_label is not None and adata_reference is not None
-            and bio_label in adata_reference.obs.columns):
-        _n_ct_early = len(adata_reference.obs[bio_label].unique())
-    _large_scale = _n_ct_early > 100
+    # Reuse the pre-check class count from section 1 (avoids re-counting).
+    _n_ct_early = _n_ct_precheck
+    _large_scale = _skip_probe  # True iff >100 classes
 
     if _large_scale:
         # LARGE-SCALE: the probe adapter's residual_mag (e.g. 3.23) grossly
