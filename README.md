@@ -11,8 +11,8 @@ ScAdver eliminates technical batch effects from single-cell RNA-seq data while p
 - 🎯 **Biology preserved** — adversarial discriminator removes batch effects without touching biological signal
 - 🏗️ **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, unbounded output with learnable scale (≤100 classes)
 - 📐 **Distribution alignment** — MMD + Moment-Matching + CORAL losses for robust domain adaptation
-- 🔀 **Two-path query projection** — neural adapter for cross-technology datasets (≤100 cell types); analytical per-class mean-shift for large perturbation screens (>100 classes)
-- 🚀 **Zero-training large-scale mode** — analytical path corrects 100k+ cells in seconds with no epochs
+- 🔀 **Two-path query projection** — neural adapter for cross-technology datasets (≤100 cell types); analytical mean-shift for large perturbation screens (>100 classes)
+- 🚀 **Fast large-scale mode** — analytical path corrects 100k+ cells in seconds; optional residual refinement exists for local experimentation but is not the validated default
 - 🖥️ **Multi-device** — CPU, CUDA, and Apple Silicon (MPS)
 
 ## Installation
@@ -79,7 +79,7 @@ The encoder is trained adversarially:
 | Classes | Path | Method |
 |---------|------|--------|
 | ≤ 100 | **Neural adapter** | `EnhancedResidualAdapter` — adversarial + MMD + CORAL + conditional alignment losses, warmup LR, early stopping |
-| > 100 | **Analytical** | Per-class mean-shift: `z' = z_query + (mean(z_ref_c) − mean(z_query_c))` — no training, completes in seconds |
+| > 100 | **Analytical** | Per-class mean-shift for all classes; optional residual refinement exists but remains experimental |
 
 Full technical details: [ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md) · [RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)
 
@@ -97,4 +97,3 @@ Full technical details: [ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLA
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
-

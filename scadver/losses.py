@@ -5,6 +5,7 @@ Provides distribution-matching losses used during residual adapter training
 to align query embeddings to the reference latent space.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -185,6 +186,59 @@ class AlignmentLossComputer(nn.Module):
             'total': total.item(),
         }
         return total, components
+
+
+class PrototypeAlignmentLoss(nn.Module):
+    """
+    Align batch centroids to reference class prototypes.
+
+    This is more stable than per-cell supervision in the large-class regime
+    because it only asks the adapter to preserve the relative position of
+    shared biological groups, not to solve a massive classification problem.
+    """
+
+    def __init__(self, min_samples: int = 3):
+        super().__init__()
+        self.min_samples = min_samples
+
+    def forward(self, embeddings, labels, prototypes):
+        """
+        Parameters
+        ----------
+        embeddings : Tensor (n, d)
+            Query embeddings after adaptation.
+        labels : array-like (n,)
+            Biological labels for the current query batch.
+        prototypes : dict[str, Tensor]
+            Reference centroid for each class label.
+
+        Returns
+        -------
+        loss : scalar Tensor
+            Mean squared centroid mismatch over classes used in this batch.
+        used : int
+            Number of classes that contributed to the loss.
+        """
+        device = embeddings.device
+        labels_arr = np.asarray(labels).astype(str)
+        total = torch.tensor(0.0, device=device)
+        used = 0
+
+        for label in np.unique(labels_arr):
+            if label not in prototypes:
+                continue
+            mask_np = labels_arr == label
+            if int(mask_np.sum()) < self.min_samples:
+                continue
+            mask = torch.as_tensor(mask_np, device=device, dtype=torch.bool)
+            centroid = embeddings[mask].mean(dim=0)
+            proto = prototypes[label].to(device)
+            total = total + (centroid - proto).pow(2).mean()
+            used += 1
+
+        if used > 0:
+            total = total / used
+        return total, used
 
 
 class SlicedWassersteinLoss(nn.Module):

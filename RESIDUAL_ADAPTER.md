@@ -7,7 +7,7 @@
 | Condition | Path | What runs |
 |-----------|------|-----------|
 | **≤ 100 classes** | Neural adapter | `EnhancedResidualAdapter` with adversarial + alignment losses |
-| **> 100 classes** | Analytical mean-shift | Per-class centroid correction — no training, seconds to complete |
+| **> 100 classes** | Analytical mean-shift | Per-class centroid correction for all classes; optional trust-region refinement exists but is still experimental |
 
 The routing is fully automatic — no parameters to set.
 
@@ -74,11 +74,11 @@ learning_rate     = 0.001
 adapter_dim       = 128    # hidden dim inside adapter
 ```
 
-### Validated performance
+### Validated behavior
 
 Pancreas dataset (14 cell types, 9 technologies):
-- **LTA** = 0.972 ✅
-- **Tech mixing** ≥ 90% of reference ceiling ✅
+- Neural residual adapter is the validated path for this regime
+- The exact score depends on the reference/query split and training run
 
 ---
 
@@ -131,6 +131,10 @@ for ALL query cells. Source mixing may be reduced.
 | Training epochs | 0 |
 | Per-class correction | ✅ (matched classes) |
 | Orphan fallback | Global mean shift |
+
+### Optional refinement
+
+An optional trust-region residual refinement can be layered on top of the analytical output for local experimentation. It is intentionally conservative and is **not** the validated default for large-class datasets at this stage.
 
 ---
 

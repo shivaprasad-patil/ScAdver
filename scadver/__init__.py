@@ -25,9 +25,11 @@ from .losses import (
     MomentMatchingLoss,
     CORALLoss,
     AlignmentLossComputer,
+    PrototypeAlignmentLoss,
+    SlicedWassersteinLoss,
 )
 
-__version__ = "1.7.3"
+__version__ = "1.7.5"
 __author__ = "Shivaprasad Patil"
 __email__ = "shivaprasad309319@gmail.com"
 
@@ -47,4 +49,6 @@ __all__ = [
     "MomentMatchingLoss",
     "CORALLoss",
     "AlignmentLossComputer",
+    "PrototypeAlignmentLoss",
+    "SlicedWassersteinLoss",
 ]

@@ -12,7 +12,8 @@ import torch.optim as optim
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import silhouette_score
 
-from .model import AdversarialBatchCorrector, initialize_weights_deterministically
+from .losses import PrototypeAlignmentLoss, SlicedWassersteinLoss
+from .model import AdversarialBatchCorrector, EnhancedResidualAdapter, initialize_weights_deterministically
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,310 @@ def _resolve_device(device):
     if device == 'mps':
         return torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     return torch.device(device)
+
+
+def _get_reference_label_lookup(model, adata_reference, bio_label):
+    """Return exact reference-label -> classifier-index mapping when available."""
+    if hasattr(model, 'bio_encoder') and getattr(model.bio_encoder, 'classes_', None) is not None:
+        classes = [str(label) for label in model.bio_encoder.classes_]
+        return {label: idx for idx, label in enumerate(classes)}
+
+    if adata_reference is not None and bio_label is not None and bio_label in adata_reference.obs.columns:
+        ref_encoder = LabelEncoder()
+        ref_encoder.fit(adata_reference.obs[bio_label].astype(str))
+        classes = [str(label) for label in ref_encoder.classes_]
+        return {label: idx for idx, label in enumerate(classes)}
+
+    return None
+
+
+def _encode_labels_with_reference(labels, label_to_idx, unmatched_index=-100):
+    """
+    Encode labels against the reference classifier vocabulary.
+
+    Unmatched labels are assigned ``unmatched_index`` so callers can exclude
+    them from supervision with ``ignore_index``.
+    """
+    labels_arr = np.asarray(labels).astype(str)
+    encoded = np.full(labels_arr.shape[0], unmatched_index, dtype=np.int64)
+    matched_mask = np.array([label in label_to_idx for label in labels_arr], dtype=bool)
+
+    if matched_mask.any():
+        encoded[matched_mask] = np.fromiter(
+            (label_to_idx[label] for label in labels_arr[matched_mask]),
+            dtype=np.int64,
+            count=int(matched_mask.sum()),
+        )
+
+    matched_classes = np.unique(labels_arr[matched_mask]) if matched_mask.any() else np.array([], dtype=labels_arr.dtype)
+    total_classes = np.unique(labels_arr)
+
+    stats = {
+        'matched_mask': matched_mask,
+        'matched_cell_ratio': float(matched_mask.mean()) if len(labels_arr) else 0.0,
+        'matched_class_ratio': len(matched_classes) / max(len(total_classes), 1),
+        'matched_classes': matched_classes,
+        'total_classes': total_classes,
+    }
+    return encoded, stats
+
+
+def _analytical_mean_shift(z_query_all_np, z_ref_np, query_ct_raw, ref_ct_indices, min_query_cells=3):
+    """
+    Apply the analytical per-class mean-shift correction used in large-scale mode.
+
+    Returns the corrected embedding, the global shift, and masks/statistics that
+    downstream refinement code can reuse.
+    """
+    query_ct_raw = np.asarray(query_ct_raw).astype(str)
+    global_shift_np = z_ref_np.mean(0) - z_query_all_np.mean(0)
+    z_corrected = z_query_all_np.copy()
+
+    query_classes = np.unique(query_ct_raw)
+    ref_classes = set(ref_ct_indices.keys()) if ref_ct_indices else set()
+    shared_classes = set(query_classes) & ref_classes
+
+    matched_mask = np.zeros(len(query_ct_raw), dtype=bool)
+    refined_mask = np.zeros(len(query_ct_raw), dtype=bool)
+    n_class_fixed = 0
+    n_global_fback = 0
+    fixed_classes = []
+    fallback_classes = []
+
+    if len(shared_classes) == 0:
+        z_corrected = z_query_all_np + global_shift_np
+        n_global_fback = len(query_classes)
+        fallback_classes = list(query_classes)
+    else:
+        for pert_cls in query_classes:
+            q_mask = query_ct_raw == pert_cls
+            q_count = int(q_mask.sum())
+            if pert_cls in ref_ct_indices:
+                matched_mask[q_mask] = True
+            if pert_cls in ref_ct_indices and q_count >= min_query_cells:
+                ref_idx = ref_ct_indices[pert_cls]
+                shift_c = z_ref_np[ref_idx].mean(0) - z_query_all_np[q_mask].mean(0)
+                z_corrected[q_mask] = z_query_all_np[q_mask] + shift_c
+                refined_mask[q_mask] = True
+                n_class_fixed += 1
+                fixed_classes.append(pert_cls)
+            else:
+                z_corrected[q_mask] = z_query_all_np[q_mask] + global_shift_np
+                n_global_fback += 1
+                fallback_classes.append(pert_cls)
+
+    stats = {
+        'query_classes': query_classes,
+        'shared_classes': np.array(sorted(shared_classes)),
+        'matched_mask': matched_mask,
+        'refine_mask': refined_mask,
+        'n_class_fixed': n_class_fixed,
+        'n_global_fback': n_global_fback,
+        'fixed_classes': np.array(fixed_classes),
+        'fallback_classes': np.array(fallback_classes),
+        'shared_cell_ratio': float(matched_mask.mean()) if len(query_ct_raw) else 0.0,
+        'refined_cell_ratio': float(refined_mask.mean()) if len(query_ct_raw) else 0.0,
+    }
+    return z_corrected, global_shift_np, stats
+
+
+def _run_large_scale_refinement(
+    analytical_embeddings,
+    query_labels,
+    refine_mask,
+    z_ref_all,
+    ref_ct_indices,
+    device,
+    learning_rate,
+    adaptation_epochs,
+    seed,
+    min_ref_cells=8,
+):
+    """
+    Refine analytical large-scale embeddings with a small trust-region adapter.
+
+    Only cells from shared, sufficiently populated classes are used for training
+    and updated in the final output. Orphan / fallback classes remain analytical.
+    """
+    query_labels = np.asarray(query_labels).astype(str)
+    refine_mask = np.asarray(refine_mask, dtype=bool)
+    train_indices = np.where(refine_mask)[0]
+
+    if len(train_indices) == 0:
+        return analytical_embeddings, {'ran': False, 'reason': 'no eligible shared classes'}
+
+    train_labels = query_labels[train_indices]
+    refinable_classes = []
+    ref_pool_indices = []
+    prototype_lookup = {}
+
+    for label in np.unique(train_labels):
+        if label not in ref_ct_indices:
+            continue
+        ref_idx = np.asarray(ref_ct_indices[label], dtype=np.int64)
+        if len(ref_idx) < min_ref_cells:
+            continue
+        refinable_classes.append(label)
+        ref_pool_indices.extend(ref_idx.tolist())
+        ref_idx_tensor = torch.as_tensor(ref_idx, dtype=torch.long, device=z_ref_all.device)
+        prototype_lookup[label] = z_ref_all.index_select(0, ref_idx_tensor).mean(dim=0).detach().clone()
+
+    refinable_classes = np.array(refinable_classes)
+    if len(refinable_classes) < 8 or len(ref_pool_indices) < 128 or len(train_indices) < 96:
+        return analytical_embeddings, {
+            'ran': False,
+            'reason': 'not enough stable shared classes for refinement',
+            'refinable_classes': len(refinable_classes),
+            'train_cells': len(train_indices),
+        }
+
+    trainable_mask = refine_mask & np.isin(query_labels, refinable_classes)
+    train_indices = np.where(trainable_mask)[0]
+    train_labels = query_labels[train_indices]
+
+    analytical_tensor = torch.as_tensor(
+        analytical_embeddings[train_indices], dtype=torch.float32, device=device,
+    )
+    ref_pool_index_tensor = torch.as_tensor(ref_pool_indices, dtype=torch.long, device=z_ref_all.device)
+    ref_pool_tensor = z_ref_all.index_select(0, ref_pool_index_tensor).detach().to(device)
+    prototype_lookup = {label: tensor.to(device) for label, tensor in prototype_lookup.items()}
+
+    latent_dim = analytical_embeddings.shape[1]
+    refine_epochs = max(8, min(24, max(adaptation_epochs // 12, 8)))
+    batch_size = min(256, max(64, len(train_indices)))
+
+    adapter = EnhancedResidualAdapter(
+        latent_dim,
+        adapter_dim=64,
+        n_layers=2,
+        dropout=0.05,
+        init_scale=0.01,
+        seed=seed + 101,
+        min_scale=0.0,
+        max_scale=0.20,
+    ).to(device)
+    optimizer = optim.AdamW(adapter.parameters(), lr=max(learning_rate * 0.5, 1e-4), weight_decay=1e-5, eps=1e-7)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(refine_epochs, 1), eta_min=max(learning_rate * 0.05, 5e-5),
+    )
+    swd_loss = SlicedWassersteinLoss(n_projections=32).to(device)
+    prototype_loss = PrototypeAlignmentLoss(min_samples=3)
+    trust_loss = nn.SmoothL1Loss()
+
+    best_state = None
+    best_loss = float('inf')
+    patience = 4
+    epochs_without_improvement = 0
+    final_delta = 0.0
+
+    print("\n🧪 LARGE-SCALE REFINEMENT: Trust-region residual adapter on analytical output")
+    print(f"   Trainable shared classes : {len(refinable_classes)}")
+    print(f"   Trainable query cells    : {len(train_indices):,} ({trainable_mask.mean():.1%} of query)")
+    print(f"   Epochs                   : {refine_epochs}")
+    print("   Losses: prototype(×6) + SWD(×0.5) + trust(×20)")
+
+    for epoch in range(refine_epochs):
+        adapter.train()
+        torch.manual_seed(seed + 300 + epoch)
+        indices = torch.randperm(analytical_tensor.shape[0], device=analytical_tensor.device)
+
+        epoch_total = 0.0
+        epoch_proto = 0.0
+        epoch_swd = 0.0
+        epoch_trust = 0.0
+        epoch_delta = 0.0
+        n_batches = 0
+
+        for start in range(0, analytical_tensor.shape[0], batch_size):
+            batch_idx = indices[start:start + batch_size]
+            analytical_batch = analytical_tensor[batch_idx]
+            batch_labels = train_labels[batch_idx.detach().cpu().numpy()]
+
+            optimizer.zero_grad()
+            refined_batch = adapter(analytical_batch)
+
+            torch.manual_seed(seed + 400 + epoch * 1000 + start)
+            ref_idx = torch.randint(0, ref_pool_tensor.shape[0], (len(batch_idx),), device=ref_pool_tensor.device)
+            ref_batch = ref_pool_tensor[ref_idx]
+
+            loss_proto, used_classes = prototype_loss(refined_batch, batch_labels, prototype_lookup)
+            loss_swd = swd_loss(ref_batch, refined_batch)
+            loss_trust = trust_loss(refined_batch, analytical_batch)
+            adapter_l2 = sum(
+                p.pow(2).sum()
+                for name, p in adapter.named_parameters()
+                if name not in ('scale', 'global_shift')
+            )
+
+            proto_weight = 6.0 if used_classes > 0 else 0.0
+            total_loss = (
+                proto_weight * loss_proto
+                + 0.5 * loss_swd
+                + 20.0 * loss_trust
+                + 1e-4 * adapter_l2
+            )
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(adapter.parameters(), max_norm=1.0)
+            optimizer.step()
+            adapter.clamp_scale_()
+
+            batch_delta = (refined_batch.detach() - analytical_batch).norm(dim=1).mean().item()
+            epoch_total += total_loss.item()
+            epoch_proto += loss_proto.item()
+            epoch_swd += loss_swd.item()
+            epoch_trust += loss_trust.item()
+            epoch_delta += batch_delta
+            n_batches += 1
+
+        scheduler.step()
+
+        avg_total = epoch_total / max(n_batches, 1)
+        avg_proto = epoch_proto / max(n_batches, 1)
+        avg_swd = epoch_swd / max(n_batches, 1)
+        avg_trust = epoch_trust / max(n_batches, 1)
+        avg_delta = epoch_delta / max(n_batches, 1)
+        final_delta = avg_delta
+
+        if avg_total < best_loss - 1e-5:
+            best_loss = avg_total
+            best_state = {k: v.detach().cpu().clone() for k, v in adapter.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epoch == 0 or (epoch + 1) % 5 == 0 or epoch + 1 == refine_epochs:
+            print(
+                f"   Epoch {epoch + 1:>2d}/{refine_epochs} | "
+                f"Total: {avg_total:.4f} | Proto: {avg_proto:.4f} | "
+                f"SWD: {avg_swd:.4f} | Trust: {avg_trust:.4f} | "
+                f"Scale: {adapter.effective_scale:.4f} | Δ: {avg_delta:.4f}"
+            )
+
+        if epochs_without_improvement >= patience and epoch >= 5:
+            print(f"   ⏹  Early stopping at epoch {epoch + 1} (no refinement improvement for {patience} epochs)")
+            break
+
+    if best_state is None:
+        return analytical_embeddings, {'ran': False, 'reason': 'refinement did not improve'}
+
+    adapter.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    adapter.eval()
+
+    refined_embeddings = analytical_embeddings.copy()
+    with torch.no_grad():
+        refined_tensor = adapter(analytical_tensor).cpu().numpy()
+    refined_embeddings[train_indices] = refined_tensor
+
+    return refined_embeddings, {
+        'ran': True,
+        'train_cells': len(train_indices),
+        'refined_cells': len(train_indices),
+        'refinable_classes': len(refinable_classes),
+        'best_loss': best_loss,
+        'final_scale': adapter.effective_scale,
+        'avg_delta': final_delta,
+        'mean_delta': final_delta,
+    }
 
 
 def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=None, query_data=None, 
@@ -189,6 +494,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     
     # Check for reference/query setup
     has_source_split = reference_data is not None and query_data is not None
+    source_encoder = None
     if has_source_split and 'Source' in adata_clean.obs.columns:
         source_encoder = LabelEncoder()
         source_labels = source_encoder.fit_transform(adata_clean.obs['Source'])
@@ -208,6 +514,11 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
         print(f"      Training samples: {X_train.shape[0]} (Reference only)")
         print(f"      Training biology labels: {len(np.unique(bio_labels_train))} unique")
         print(f"      Training batch labels: {len(np.unique(batch_labels_train))} unique")
+
+        if len(np.unique(source_labels_train)) < 2:
+            print("   ⚠️  Source adversary DISABLED — reference-only training leaves a single source class")
+            source_labels_train = None
+            source_encoder = None
         
     else:
         source_labels = None
@@ -221,7 +532,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     input_dim = X.shape[1]
     n_bio_labels = len(np.unique(bio_labels))
     n_batches = len(np.unique(batch_labels))
-    n_sources = len(np.unique(source_labels)) if source_labels is not None else None
+    n_sources = len(np.unique(source_labels_train)) if source_labels_train is not None else None
     
     model = AdversarialBatchCorrector(
         input_dim, latent_dim, n_bio_labels, n_batches, n_sources
@@ -251,7 +562,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     recon_criterion = nn.MSELoss()
     bio_criterion = nn.CrossEntropyLoss()
     batch_criterion = nn.CrossEntropyLoss()
-    source_criterion = nn.CrossEntropyLoss() if source_labels is not None else None
+    source_criterion = nn.CrossEntropyLoss() if source_labels_train is not None else None
     
     # Convert to tensors - Use training data only (Reference samples for reference-query setup)
     X_tensor = torch.FloatTensor(X_train).to(device)
@@ -444,7 +755,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     if has_source_split and 'Source' in adata_clean.obs.columns:
         source_eval = adata_clean.obs['Source']
         source_sil = silhouette_score(X_eval, source_eval)
-        source_score = (1 - source_sil) / 2 + 0.5
+        source_score = float(np.clip((1 - source_sil) / 2, 0.0, 1.0))
         metrics['source_integration'] = source_score
         metrics['source_silhouette'] = source_sil
         metrics['overall_score'] = 0.4 * bio_score + 0.3 * batch_score + 0.3 * source_score
@@ -683,20 +994,23 @@ def detect_domain_shift(model, adata_query, adata_reference, bio_label=None, dev
     bio_labels_tensor = None
     detect_bio_weight = 0.0
     if bio_label is not None and bio_label in adata_query.obs.columns:
-        bio_encoder_local = LabelEncoder()
-        bio_labels = bio_encoder_local.fit_transform(adata_query.obs.iloc[query_idx][bio_label])
-        bio_labels_tensor = torch.LongTensor(bio_labels).to(device)
-        bio_loss_fn = nn.CrossEntropyLoss()
-        n_det_classes = len(bio_encoder_local.classes_)
-        # Same adaptive scaling as main path
-        if n_det_classes <= 20:
-            detect_bio_weight = 5.0
-        elif n_det_classes <= 100:
-            detect_bio_weight = 1.0
-        elif n_det_classes <= 500:
-            detect_bio_weight = 0.2
-        else:
-            detect_bio_weight = 0.02
+        label_to_idx = _get_reference_label_lookup(model, adata_reference, bio_label)
+        if label_to_idx is not None:
+            query_labels = adata_query.obs.iloc[query_idx][bio_label].astype(str)
+            encoded_labels, label_stats = _encode_labels_with_reference(query_labels, label_to_idx)
+            if label_stats['matched_class_ratio'] >= 0.3 and label_stats['matched_cell_ratio'] >= 0.3:
+                bio_labels_tensor = torch.LongTensor(encoded_labels).to(device)
+                bio_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+                n_det_classes = len(label_stats['matched_classes'])
+                # Same adaptive scaling as main path
+                if n_det_classes <= 20:
+                    detect_bio_weight = 5.0
+                elif n_det_classes <= 100:
+                    detect_bio_weight = 1.0
+                elif n_det_classes <= 500:
+                    detect_bio_weight = 0.2
+                else:
+                    detect_bio_weight = 0.02
     
     # Quick training loop to test if adapter learns meaningful corrections
     batch_size = 128
@@ -887,7 +1201,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     
     from .model import (EnhancedResidualAdapter, DomainDiscriminator,
                         initialize_weights_deterministically)
-    from .losses import AlignmentLossComputer, SlicedWassersteinLoss
+    from .losses import AlignmentLossComputer
     
     # ------------------------------------------------------------------
     # 0. Reproducibility
@@ -1005,7 +1319,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         z_sample = model.encoder(X_query_tensor[:10])
         latent_dim = z_sample.shape[1]
     
-    # 4b. Instantiate adapter + discriminator with deterministic init
+    # 4b. Determine routing-specific scale defaults
     residual_mag = detection_result['residual_magnitude']
     # Reuse the pre-check class count from section 1 (avoids re-counting).
     _n_ct_early = _n_ct_precheck
@@ -1024,47 +1338,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         # adapter can produce corrections of the right order from epoch 1.
         init_scale = max(residual_mag * 0.8, 0.1)
 
-    adapter = EnhancedResidualAdapter(
-        latent_dim, adapter_dim, n_layers=3, dropout=0.1,
-        init_scale=init_scale, seed=seed + 11,
-    ).to(device)
-    # Weaker disc for large class counts — fewer hidden units prevent the
-    # discriminator from trivially separating domains, giving the adapter
-    # room to learn a meaningful global alignment.
-    disc_hidden = 128 if _large_scale else 256
-    domain_disc = DomainDiscriminator(latent_dim, hidden_dim=disc_hidden, dropout=0.3).to(device)
-    initialize_weights_deterministically(domain_disc, seed=seed + 12)
-    
-    print(f"\n🏗️  Initializing enhanced residual adapter...")
-    print(f"   Architecture: {latent_dim} → [{adapter_dim}]*3 → {latent_dim}  (unbounded residual, learnable scale)")
-    print(f"   Domain shift magnitude : {residual_mag:.4f}")
-    print(f"   Adapter init_scale     : {init_scale:.4f}  (80% of shift)")
-    print(f"   Initial adapter scale  : {adapter.effective_scale:.4f}")
-    
-    # 4c. Optimisers with cosine annealing
-    optimizer_adapter = optim.AdamW(
-        adapter.parameters(), lr=learning_rate, weight_decay=1e-5, eps=1e-7,
-    )
-    optimizer_disc = optim.AdamW(
-        domain_disc.parameters(), lr=learning_rate * 0.2, weight_decay=1e-4, eps=1e-7,
-    )
-    # Warm-restart cosine schedule: LR resets every T_0 epochs (doubling
-    # each cycle) so the adapter never stalls from LR decay, even in
-    # extended training beyond adaptation_epochs.
-    _T0 = min(adaptation_epochs, 100)
-    scheduler_adapter = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer_adapter, T_0=_T0, T_mult=2, eta_min=learning_rate * 0.01,
-    )
-    scheduler_disc = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer_disc, T_0=_T0, T_mult=2, eta_min=learning_rate * 0.01,
-    )
-    
-    # 4d. Alignment losses
-    alignment_loss = AlignmentLossComputer(mmd_weight=1.0, moment_weight=0.5, coral_weight=0.3).to(device)
-    # SWD used for large-scale mode — more reliable than MMD in 256-d
-    swd_loss = SlicedWassersteinLoss(n_projections=50).to(device)
-    
-    # 4e. Reference data
+    # 4c. Reference data
     if adata_reference is not None:
         X_ref = adata_reference.X.copy()
         if hasattr(X_ref, 'toarray'):
@@ -1076,66 +1350,46 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         X_ref_tensor = None
         print("   ⚠️  No reference data: Using unsupervised adaptation")
     
-    # 4f. Biological labels with adaptive weight
+    # 4d. Biological labels with adaptive weight
     bio_loss_fn       = None
     bio_labels_tensor = None
     adaptive_bio_weight = 0.0
 
     if bio_label is not None and bio_label in adata_query.obs.columns:
-        # Infer number of output classes from the reference bio_classifier's final Linear layer
-        ref_n_classes = None
-        for layer in reversed(list(model.bio_classifier.modules())):
-            if isinstance(layer, nn.Linear):
-                ref_n_classes = layer.out_features
-                break
-
-        n_query_classes = len(adata_query.obs[bio_label].unique())
-
-        # Overlap ratio: how many query classes fit inside the ref classifier's vocabulary?
-        overlap_ratio = min(n_query_classes, ref_n_classes) / max(n_query_classes, 1) \
-                        if ref_n_classes else 0.0
+        query_ct_raw = np.asarray(adata_query.obs[bio_label]).astype(str)
+        n_query_classes = len(np.unique(query_ct_raw))
+        label_to_idx = _get_reference_label_lookup(model, adata_reference, bio_label)
+        ref_n_classes = len(label_to_idx) if label_to_idx is not None else None
+        encoded_labels, label_stats = _encode_labels_with_reference(query_ct_raw, label_to_idx) if label_to_idx else (None, None)
 
         print(f"   Bio label      : {bio_label}")
         print(f"   Query classes  : {n_query_classes}")
         print(f"   Ref classifier : {ref_n_classes} output classes")
-        print(f"   Overlap ratio  : {overlap_ratio:.1%}")
+        if label_stats is not None:
+            print(f"   Shared classes : {len(label_stats['matched_classes'])}/{len(label_stats['total_classes'])}")
+            print(f"   Shared cells   : {label_stats['matched_cell_ratio']:.1%}")
+            print(f"   Overlap ratio  : {label_stats['matched_class_ratio']:.1%}")
+        else:
+            print("   Overlap ratio  : 0.0%")
 
-        if overlap_ratio < 0.3:
-            # Poor overlap — ref-classifier gradients would be harmful noise
-            print("   ⚠️  Bio supervision DISABLED — class overlap too low (<30%)")
-            query_ct_raw = None
-        elif n_query_classes > 100:
-            # LARGE-SCALE MODE: disable frozen-classifier bio loss  —
-            # LabelEncoder integers differ from Stage-1 classifier IDs
-            # and would push cells toward wrong ref clusters.
-            # BUT keep query_ct_raw for paired mean alignment:
-            # directly minimising per-perturbation mean distance is the
-            # only semantically correct signal for this dataset.
+        if label_stats is None or label_stats['matched_class_ratio'] < 0.3 or label_stats['matched_cell_ratio'] < 0.3:
+            print("   ⚠️  Bio supervision DISABLED — exact label overlap too low (<30%)")
+        elif _large_scale or n_query_classes > 100:
             adaptive_bio_weight = 0.0
             bio_labels_tensor = None
-            query_ct_raw = np.array(adata_query.obs[bio_label])
-            print(f"   ⚠️  Bio classifier DISABLED — {n_query_classes} classes "
-                  f"(label mapping unreliable); paired mean alignment will be used instead")
+            regime_reason = "analytical projection selected from reference class count" if _large_scale else "query label space is too large"
+            print(f"   ⚠️  Bio classifier DISABLED — {regime_reason}")
         else:
-            # Standard mode (≤100 classes): bio labels are reliable,
-            # per-class batches are large enough for conditional alignment.
-            #   ≤20  classes → 0.5
-            #   ≤100 classes → 0.2
             if n_query_classes <= 20:
                 adaptive_bio_weight = 0.5
             else:
                 adaptive_bio_weight = 0.2
 
-            bio_enc = LabelEncoder()
-            bio_labels_raw = bio_enc.fit_transform(adata_query.obs[bio_label])
-            # Clamp indices to ref classifier's output range to prevent index errors
-            if ref_n_classes is not None:
-                bio_labels_raw = np.clip(bio_labels_raw, 0, ref_n_classes - 1)
-            bio_labels_tensor = torch.LongTensor(bio_labels_raw).to(device)
-            bio_loss_fn       = nn.CrossEntropyLoss()
-            # Keep raw string labels for conditional alignment
-            query_ct_raw = np.array(adata_query.obs[bio_label])
-            print(f"   ✅ Bio supervision ENABLED  — weight = {adaptive_bio_weight} ({n_query_classes} classes)")
+            bio_labels_tensor = torch.LongTensor(encoded_labels).to(device)
+            bio_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+            n_unmatched = int((~label_stats['matched_mask']).sum())
+            unmatched_str = f", ignoring {n_unmatched} unmatched cells" if n_unmatched else ""
+            print(f"   ✅ Bio supervision ENABLED  — weight = {adaptive_bio_weight} ({n_query_classes} classes{unmatched_str})")
     else:
         print("   ⚠️  No biological labels: Using unsupervised adaptation")
         query_ct_raw = None
@@ -1146,27 +1400,6 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     if X_ref_tensor is not None:
         with torch.no_grad():
             z_ref_all = model.encoder(X_ref_tensor)
-
-        # ------ Large-scale mean-shift initialisation --------
-        # For large-scale mode, pre-compute the global inter-domain
-        # translation and inject it as a trainable parameter.  This means
-        # the adapter starts with the bulk of the domain shift already
-        # corrected; the network only needs to learn per-cell refinements.
-        # This dramatically accelerates adversarial convergence.
-        if _large_scale:
-            with torch.no_grad():
-                # Encode full query to compute its mean
-                z_query_enc_all = model.encoder(X_query_tensor)
-                mean_shift = (z_ref_all.mean(0) - z_query_enc_all.mean(0)).detach()
-                del z_query_enc_all  # free memory immediately
-            # Register as trainable parameter on the adapter
-            adapter.global_shift = nn.Parameter(mean_shift.clone())
-            print(f"   Mean-shift init    : ||shift|| = {mean_shift.norm().item():.4f}"
-                  f"  (adapter starts with inter-domain translation pre-applied)")
-            # Rebuild the optimizer so global_shift is included
-            optimizer_adapter = optim.AdamW(
-                adapter.parameters(), lr=learning_rate, weight_decay=1e-5, eps=1e-7,
-            )
 
         # Group reference embeddings by cell type for conditional alignment
         if bio_label is not None and bio_label in adata_reference.obs.columns:
@@ -1201,70 +1434,107 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     #   ≤100 classes  → cell-type atlas, cross-technology, non-linear shift
     # ------------------------------------------------------------------
     if _large_scale and X_ref_tensor is not None and query_ct_raw is not None:
-        print("\n🧮 LARGE-SCALE MODE: Analytical per-perturbation mean-shift")
-        print(f"   {_n_ct_early} classes > 100 → using analytical path (validated faster & more accurate for large screens)")
-        print("   Neural adapter reserved for cross-technology datasets (≤100 cell types).")
+        print("\n🧮 LARGE-SCALE MODE: Analytical mean-shift + optional residual refinement")
+        print(f"   {_n_ct_early} classes > 100 → analytical base path for large perturbation screens")
+        print("   Shared classes with enough cells can receive a small trust-region residual refinement.")
 
         with torch.no_grad():
-            _z_q_chunks = []
-            for _i in range(0, X_query_tensor.shape[0], 4096):
-                _z_q_chunks.append(model.encoder(X_query_tensor[_i:_i + 4096]))
-            z_query_all_np = torch.cat(_z_q_chunks, dim=0).cpu().numpy()  # (N_q, D)
-            z_ref_np = z_ref_all.cpu().numpy()                            # (N_r, D)
+            z_query_chunks = []
+            for start in range(0, X_query_tensor.shape[0], 4096):
+                z_query_chunks.append(model.encoder(X_query_tensor[start:start + 4096]))
+            z_query_all_np = torch.cat(z_query_chunks, dim=0).cpu().numpy()
+            z_ref_np = z_ref_all.detach().cpu().numpy()
 
-        global_shift_np = z_ref_np.mean(0) - z_query_all_np.mean(0)
-        print(f"   Global shift ‖δ‖ : {np.linalg.norm(global_shift_np):.4f}")
-
-        _ref_pert_arr = (
-            np.array(adata_reference.obs[bio_label])
-            if (adata_reference is not None and bio_label is not None
-                    and bio_label in adata_reference.obs.columns)
-            else None
+        z_corrected, global_shift_np, analytical_stats = _analytical_mean_shift(
+            z_query_all_np=z_query_all_np,
+            z_ref_np=z_ref_np,
+            query_ct_raw=query_ct_raw,
+            ref_ct_indices=ref_ct_indices,
+            min_query_cells=3,
         )
 
-        z_corrected = z_query_all_np.copy()
-        _n_class_fixed = 0
-        _n_global_fback = 0
-
-        # Check for zero overlap between query and ref class labels
-        _query_classes = set(np.unique(query_ct_raw))
-        _ref_classes   = set(ref_ct_indices.keys()) if ref_ct_indices else set()
-        _shared_classes = _query_classes & _ref_classes
-        if len(_shared_classes) == 0:
+        if len(analytical_stats['shared_classes']) == 0:
             import warnings as _warnings
             _warnings.warn(
                 "Zero perturbation class overlap between query and reference — "
-                "no per-class centroid alignment possible. "
-                "Falling back to global mean shift for ALL query cells. "
-                "Source mixing may be reduced; LTA is not meaningful.",
-                UserWarning, stacklevel=2,
+                "no per-class centroid alignment possible. Falling back to "
+                "global mean shift for all query cells. Source mixing may be "
+                "reduced; LTA is not meaningful.",
+                UserWarning,
+                stacklevel=2,
             )
             print(f"   ⚠️  Zero class overlap — applying global mean shift to all {len(z_query_all_np):,} query cells.")
-            z_corrected = z_query_all_np + global_shift_np
-            _n_global_fback = len(_query_classes)
-        else:
-            for _pert_cls in np.unique(query_ct_raw):
-                _q_mask = query_ct_raw == _pert_cls
-                if (_ref_pert_arr is not None
-                        and _pert_cls in ref_ct_indices
-                        and _q_mask.sum() >= 3):
-                    _r_idx   = ref_ct_indices[_pert_cls]
-                    _shift_c = z_ref_np[_r_idx].mean(0) - z_query_all_np[_q_mask].mean(0)
-                    z_corrected[_q_mask] = z_query_all_np[_q_mask] + _shift_c
-                    _n_class_fixed += 1
-                else:
-                    z_corrected[_q_mask] = z_query_all_np[_q_mask] + global_shift_np
-                    _n_global_fback += 1
 
-        print(f"   Per-class corrected : {_n_class_fixed} classes")
-        print(f"   Global fallback     : {_n_global_fback} classes  (orphan / too few cells)")
+        print(f"   Global shift ‖δ‖     : {np.linalg.norm(global_shift_np):.4f}")
+        print(f"   Shared classes       : {len(analytical_stats['shared_classes'])}/{len(analytical_stats['query_classes'])}")
+        print(f"   Per-class corrected  : {analytical_stats['n_class_fixed']} classes")
+        print(f"   Global fallback      : {analytical_stats['n_global_fback']} classes  (orphan / too few cells)")
+
+        refinement_embeddings, refinement_stats = _run_large_scale_refinement(
+            analytical_embeddings=z_corrected,
+            query_labels=query_ct_raw,
+            refine_mask=analytical_stats['refine_mask'],
+            z_ref_all=z_ref_all,
+            ref_ct_indices=ref_ct_indices,
+            device=device,
+            learning_rate=learning_rate,
+            adaptation_epochs=adaptation_epochs,
+            seed=seed,
+        )
+
+        if refinement_stats.get('ran'):
+            z_corrected = refinement_embeddings
+            print(f"   Residual refinement  : enabled on {refinement_stats['refinable_classes']} classes / {refinement_stats['train_cells']:,} cells")
+            print(f"   Final adapter scale  : {refinement_stats['final_scale']:.4f}")
+            print(f"   Mean residual Δ      : {refinement_stats['avg_delta']:.4f}")
+        else:
+            reason = refinement_stats.get('reason', 'not applicable')
+            print(f"   Residual refinement  : skipped ({reason})")
 
         adata_corrected = adata_query.copy()
         adata_corrected.obsm['X_ScAdver'] = z_corrected
-        print(f"   ✅ Analytical embedding : {z_corrected.shape}")
-        print("\n🎉 ANALYTICAL PROJECTION COMPLETE!")
-        print("   Output: adata.obsm['X_ScAdver'] (per-perturbation mean-shift corrected)")
+        print(f"   ✅ Large-scale embedding : {z_corrected.shape}")
+        print("\n🎉 LARGE-SCALE PROJECTION COMPLETE!")
+        print("   Output: adata.obsm['X_ScAdver'] (analytical mean-shift with optional micro-refinement)")
         return adata_corrected
+
+    # 4e. Instantiate adapter + discriminator with deterministic init
+    adapter = EnhancedResidualAdapter(
+        latent_dim,
+        adapter_dim,
+        n_layers=3,
+        dropout=0.1,
+        init_scale=init_scale,
+        seed=seed + 11,
+        min_scale=init_scale * 0.5,
+    ).to(device)
+    disc_hidden = 256
+    domain_disc = DomainDiscriminator(latent_dim, hidden_dim=disc_hidden, dropout=0.3).to(device)
+    initialize_weights_deterministically(domain_disc, seed=seed + 12)
+
+    print(f"\n🏗️  Initializing enhanced residual adapter...")
+    print(f"   Architecture: {latent_dim} → [{adapter_dim}]*3 → {latent_dim}  (unbounded residual, learnable scale)")
+    print(f"   Domain shift magnitude : {residual_mag:.4f}")
+    print(f"   Adapter init_scale     : {init_scale:.4f}  (80% of shift)")
+    print(f"   Initial adapter scale  : {adapter.effective_scale:.4f}")
+
+    # 4f. Optimisers with cosine annealing
+    optimizer_adapter = optim.AdamW(
+        adapter.parameters(), lr=learning_rate, weight_decay=1e-5, eps=1e-7,
+    )
+    optimizer_disc = optim.AdamW(
+        domain_disc.parameters(), lr=learning_rate * 0.2, weight_decay=1e-4, eps=1e-7,
+    )
+    _T0 = min(adaptation_epochs, 100)
+    scheduler_adapter = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer_adapter, T_0=_T0, T_mult=2, eta_min=learning_rate * 0.01,
+    )
+    scheduler_disc = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer_disc, T_0=_T0, T_mult=2, eta_min=learning_rate * 0.01,
+    )
+
+    # 4g. Alignment losses
+    alignment_loss = AlignmentLossComputer(mmd_weight=1.0, moment_weight=0.5, coral_weight=0.3).to(device)
 
     # ------------------------------------------------------------------
     # 6. Neural adapter training loop  (≤100 classes: cross-technology datasets)
@@ -1537,13 +1807,9 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
             torch.nn.utils.clip_grad_norm_(adapter.parameters(), max_norm=1.0)
             optimizer_adapter.step()
             
-            # Scale floor: prevent adapter scale from collapsing below
-            # 50% of init_scale.  Without this, the optimiser shrinks
-            # scale when the adapter network is still noisy, reducing
-            # correction magnitude and trapping alignment at a poor
-            # local minimum.
-            with torch.no_grad():
-                adapter.scale.data.clamp_(min=init_scale * 0.5)
+            # Prevent the learnable scale from collapsing below the
+            # configured floor while keeping the clamp logic centralized.
+            adapter.clamp_scale_()
             
             epoch_adapter_loss += loss_total.item()
             n_batches += 1

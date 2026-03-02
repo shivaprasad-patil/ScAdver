@@ -457,13 +457,15 @@ adata_query_corrected = transform_query_adaptive(
     bio_label='celltype',     # Optional but recommended
 )
 
-# What happened (v1.7.3 two-path routing):
+# What happened (v1.7.5 two-path routing):
 # 1. ScAdver counts distinct biological classes in the reference
 # 2. If classes ≤ 100 → trains EnhancedResidualAdapter with adversarial +
 #    MMD + CORAL + moment-matching losses
 #    Output: z' = z + scale * R(z)  in same latent space as z_ref
-# 3. If classes > 100 → analytical per-class mean-shift, no training
+# 3. If classes > 100 → analytical per-class mean-shift is the validated path
+#    Optional trust-region residual refinement can be enabled for local testing
 #    Output: z' = z + (centroid_ref_class - centroid_query_class)
+#            with an optional small refinement term in experimental runs
 ```
 
 ### Result

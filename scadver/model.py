@@ -227,7 +227,8 @@ class EnhancedResidualAdapter(nn.Module):
     """
     
     def __init__(self, latent_dim, adapter_dim=128, n_layers=3, dropout=0.1,
-                 init_scale=0.01, mean_shift=None, seed=None):
+                 init_scale=0.01, mean_shift=None, seed=None,
+                 min_scale=None, max_scale=None):
         super().__init__()
         
         layers = []
@@ -247,6 +248,8 @@ class EnhancedResidualAdapter(nn.Module):
         
         # Learnable scaling — starts small so the adapter is near-identity
         self.scale = nn.Parameter(torch.tensor(init_scale))
+        self.min_scale = min_scale
+        self.max_scale = max_scale
 
         # Optional global shift (large-scale mode).
         # Initialised to the inter-domain mean offset so the adapter
@@ -277,6 +280,15 @@ class EnhancedResidualAdapter(nn.Module):
     def effective_scale(self):
         """Current magnitude of the scaling parameter (for monitoring)."""
         return self.scale.item()
+
+    def clamp_scale_(self):
+        """Clamp the learnable residual scale in-place when bounds are set."""
+        if self.min_scale is None and self.max_scale is None:
+            return
+        min_val = self.min_scale if self.min_scale is not None else float("-inf")
+        max_val = self.max_scale if self.max_scale is not None else float("inf")
+        with torch.no_grad():
+            self.scale.data.clamp_(min=min_val, max=max_val)
 
 
 class DomainDiscriminator(nn.Module):
