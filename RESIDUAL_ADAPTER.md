@@ -121,7 +121,7 @@ If **no query class** has a reference counterpart, a `UserWarning` is raised and
 ```
 UserWarning: "Zero perturbation class overlap between query and reference —
 no per-class centroid alignment possible. Falling back to global mean shift
-for ALL query cells. Source mixing may be reduced; LTA is not meaningful."
+for ALL query cells. Source mixing may be reduced.
 ```
 
 ### Properties
@@ -129,10 +129,8 @@ for ALL query cells. Source mixing may be reduced; LTA is not meaningful."
 | Property | Value |
 |----------|-------|
 | Training epochs | 0 |
-| Runtime (100k cells) | ~7 seconds |
 | Per-class correction | ✅ (matched classes) |
 | Orphan fallback | Global mean shift |
-| LTA meaningful? | Only for matched classes |
 
 ---
 
@@ -179,16 +177,5 @@ adata_query_corrected.obsm['X_ScAdver']   # batch-corrected latent embeddings
 | Non-linear shift | ✅ Handled | ❌ Assumes translational shift per class |
 | Zero overlap | Falls back to direct projection | Falls back to global mean shift (warns) |
 | Orphan query classes | Aligned via distribution loss | Global mean shift |
-| Runtime | Minutes | Seconds |
-
----
-
-## Removed in v1.7.3
-
-The following approach from earlier versions has been **removed**:
-
-> ~~Automatic detection: trains a probe adapter for ~30 epochs and measures ‖R(z)‖ to decide whether adaptation is needed~~
-
-This was replaced by the class-count routing above, which is simpler, faster, and empirically more accurate.
 
 ---
