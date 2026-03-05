@@ -4,7 +4,12 @@ from anndata import AnnData
 from sklearn.preprocessing import LabelEncoder
 
 from scadver import core
-from scadver.core import _encode_labels_with_reference, adversarial_batch_correction
+from scadver.core import (
+    _build_reference_neighbor_targets,
+    _encode_labels_with_reference,
+    _get_domain_mixing_labels,
+    adversarial_batch_correction,
+)
 from scadver.model import AdversarialBatchCorrector
 
 
@@ -37,6 +42,43 @@ def test_encode_labels_with_reference_preserves_reference_indices_for_subset_lab
     assert stats["matched_class_ratio"] == 1.0
     assert stats["matched_cell_ratio"] == 1.0
     assert [int(idx) for idx in encoded] == [label_to_idx[label] for label in query_classes]
+
+
+def test_build_reference_neighbor_targets_can_balance_across_batches():
+    ref_embeddings = np.asarray(
+        [
+            [0.0, 0.0],
+            [0.1, 0.0],
+            [10.0, 0.0],
+            [10.1, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    ref_labels = np.asarray(["A", "A", "A", "A"])
+    ref_batches = np.asarray(["v2", "v2", "v3", "v3"])
+    query_embeddings = np.asarray([[0.05, 0.0]], dtype=np.float32)
+    query_labels = np.asarray(["A"])
+
+    unbalanced, matched_unbalanced = _build_reference_neighbor_targets(
+        ref_embeddings=ref_embeddings,
+        ref_labels=ref_labels,
+        query_embeddings=query_embeddings,
+        query_labels=query_labels,
+        k=2,
+    )
+    balanced, matched_balanced = _build_reference_neighbor_targets(
+        ref_embeddings=ref_embeddings,
+        ref_labels=ref_labels,
+        query_embeddings=query_embeddings,
+        query_labels=query_labels,
+        k=2,
+        ref_batch_labels=ref_batches,
+    )
+
+    assert matched_unbalanced[0]
+    assert matched_balanced[0]
+    assert np.allclose(unbalanced[0], [0.05, 0.0], atol=1e-5)
+    assert np.allclose(balanced[0], [5.05, 0.0], atol=1e-5)
 
 
 def test_reference_only_training_disables_single_class_source_adversary():
@@ -234,3 +276,27 @@ def test_transform_query_adaptive_ignores_unmatched_cells_in_neural_bio_supervis
     captured = capsys.readouterr().out
     assert "ignoring 4 unmatched cells" in captured
     assert adata_out.obsm["X_ScAdver"].shape == (len(query_labels), 4)
+
+
+def test_get_domain_mixing_labels_uses_reference_query_roles():
+    adata_ref = _make_adata(
+        X=np.zeros((4, 2)),
+        obs={
+            "Source": ["AZ", "AZ", "AZ", "AZ"],
+            "batch": ["b0", "b1", "b0", "b1"],
+        },
+    )
+    adata_query = _make_adata(
+        X=np.zeros((4, 2)),
+        obs={
+            "Source": ["Phenaros", "Phenaros", "Phenaros", "Phenaros"],
+            "batch": ["b0", "b1", "b0", "b1"],
+        },
+    )
+
+    col, ref_labels, query_labels, use_ref_ceiling = _get_domain_mixing_labels(adata_ref, adata_query)
+
+    assert col == "role"
+    assert np.all(ref_labels == "reference")
+    assert np.all(query_labels == "query")
+    assert use_ref_ceiling is False

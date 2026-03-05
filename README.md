@@ -11,7 +11,7 @@ ScAdver eliminates technical batch effects from single-cell RNA-seq data while p
 - 🎯 **Biology preserved** — adversarial discriminator removes batch effects without touching biological signal
 - 🏗️ **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, unbounded output with learnable scale (≤100 classes)
 - 📐 **Distribution alignment** — MMD + Moment-Matching + CORAL losses for robust domain adaptation
-- 🔀 **Two-path query projection** — neural adapter for cross-technology datasets (≤100 cell types); analytical mean-shift for large perturbation screens (>100 classes)
+- 🔀 **Probe-gated query projection** — `transform_query_adaptive` uses a raw-shift probe (`||Δ(z)||`) plus overlap/class-count gate to route direct vs neighborhood vs neural vs analytical paths
 - 🚀 **Fast large-scale mode** — analytical path corrects 100k+ cells in seconds; optional residual refinement exists for local experimentation but is not the validated default
 - 🖥️ **Multi-device** — CPU, CUDA, and Apple Silicon (MPS)
 
@@ -43,11 +43,12 @@ adata_corrected, model, metrics = adversarial_batch_correction(
 
 ### Workflow 2 — Reference → Query (Train-Then-Project)
 
-Split data into reference and query yourself, train on reference only, then project query batches automatically. `transform_query_adaptive` probes for domain shift and trains a residual adapter only when needed.
+Split data into reference and query yourself, train on reference only, then project query batches automatically. `transform_query_adaptive` probes for domain shift and routes query projection only when needed.
 
 **✅ Use when** query batches arrive over time, come from a different protocol, or you want to deploy a reusable model.
 
-→ See **[examples/query_projection_notebook.ipynb](examples/query_projection_notebook.ipynb)** for a complete walkthrough
+→ Pancreas walkthrough: **[examples/ScAdver_pancreas_batch_correction.ipynb](examples/ScAdver_pancreas_batch_correction.ipynb)**  
+→ PBMC v2/v3 walkthrough: **[examples/ScAdver_pbmc_batch_correction.ipynb](examples/ScAdver_pbmc_batch_correction.ipynb)**
 
 ---
 
@@ -74,11 +75,18 @@ The encoder is trained adversarially:
 - A **bio-classifier** pushes the encoder to retain cell-type signal
 - A **batch discriminator** pushes the encoder to discard technical batch signal
 
-`transform_query_adaptive` automatically routes to one of two paths based on class count:
+`transform_query_adaptive` uses probe + gate routing:
+
+1. Compute raw latent shift `||Δ(z)||` (same-class balanced-neighbor distance when labels overlap).
+2. If `||Δ(z)|| <= 0.1`, return direct projection.
+3. If `||Δ(z)|| > 0.1` and overlap is strong (`shared_ratio >= 0.8`) with moderate class count (`n_classes <= 40`), use neighborhood residual mode.
+4. Otherwise, use the neural adapter path for `<=100` classes.
+5. For `>100` reference classes, route to analytical mean-shift.
 
 | Classes | Path | Method |
 |---------|------|--------|
-| ≤ 100 | **Neural adapter** | `EnhancedResidualAdapter` — adversarial + MMD + CORAL + conditional alignment losses, warmup LR, early stopping |
+| ≤ 40 (strong overlap) | **Neighborhood residual** | Same-class, assay-balanced neighbor targets with deterministic residual step |
+| ≤ 100 (otherwise) | **Neural adapter** | `EnhancedResidualAdapter` — adversarial + alignment losses, warmup, early stopping, final safeguard |
 | > 100 | **Analytical** | Per-class mean-shift for all classes; optional residual refinement exists but remains experimental |
 
 Full technical details: [ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md) · [RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)

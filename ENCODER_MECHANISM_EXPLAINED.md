@@ -8,6 +8,17 @@ ScAdver uses a **two-phase approach**:
 
 This document explains the complete mechanism in detail.
 
+Current example notebooks:
+- `examples/ScAdver_pancreas_batch_correction.ipynb`
+- `examples/ScAdver_pbmc_batch_correction.ipynb`
+
+Current auto-routing for query projection (`transform_query_adaptive`):
+1. Compute raw shift `||Δ(z)||` from reference/query latent space.
+2. If `||Δ(z)|| <= 0.1`, return direct projection.
+3. If `||Δ(z)|| > 0.1` and overlap is strong (`shared_ratio >= 0.8`) with `n_classes <= 40`, run neighborhood residual mode.
+4. Otherwise, for `<=100` classes, run neural residual adapter mode.
+5. For `>100` classes, run analytical mean-shift path.
+
 ---
 
 ## 📊 PHASE 1: Training the Encoder on Reference Data

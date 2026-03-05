@@ -1,5 +1,5 @@
 """
-AdverBatchBio: Adversarial Batch Correction for Single-Cell Data
+ScAdver — Adversarial Batch Correction for Single-Cell Data
 
 A Python package for performing adversarial batch correction on single-cell data
 while preserving biological signal and promoting batch mixing.
@@ -17,6 +17,7 @@ from .model import (
     AdversarialBatchCorrector,
     ResidualAdapter,
     EnhancedResidualAdapter,
+    NeighborhoodResidualAdapter,
     DomainDiscriminator,
     initialize_weights_deterministically,
 )
@@ -29,7 +30,7 @@ from .losses import (
     SlicedWassersteinLoss,
 )
 
-__version__ = "1.7.5"
+__version__ = "1.7.8"
 __author__ = "Shivaprasad Patil"
 __email__ = "shivaprasad309319@gmail.com"
 
@@ -43,6 +44,7 @@ __all__ = [
     "AdversarialBatchCorrector",
     "ResidualAdapter",
     "EnhancedResidualAdapter",
+    "NeighborhoodResidualAdapter",
     "DomainDiscriminator",
     "initialize_weights_deterministically",
     "MMDLoss",

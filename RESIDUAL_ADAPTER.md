@@ -2,18 +2,42 @@
 
 ## Overview
 
-`transform_query_adaptive` projects query data into a pre-trained reference latent space. It **automatically selects one of two paths** based on the number of biological classes in the reference:
+`transform_query_adaptive` projects query data into a pre-trained reference latent space. It uses **probe-gated routing**:
 
 | Condition | Path | What runs |
 |-----------|------|-----------|
-| **≤ 100 classes** | Neural adapter | `EnhancedResidualAdapter` with adversarial + alignment losses |
-| **> 100 classes** | Analytical mean-shift | Per-class centroid correction for all classes; optional trust-region refinement exists but is still experimental |
+| `||Δ(z)|| <= 0.1` | Direct projection | Frozen encoder only (`z = E(x_query)`) |
+| `||Δ(z)|| > 0.1`, strong overlap (`shared_ratio >= 0.8`) and `n_classes <= 40` | Neighborhood residual | Same-class balanced-neighbor residual update |
+| `||Δ(z)|| > 0.1`, `n_classes <= 100` (otherwise) | Neural adapter | `EnhancedResidualAdapter` with adversarial + alignment losses |
+| `>100` reference classes | Analytical mean-shift | Per-class centroid correction; optional trust-region refinement remains experimental |
 
-The routing is fully automatic — no parameters to set.
+Routing is automatic in `alignment_mode='auto'`.
 
 ---
 
-## Path A — Neural Adapter (≤ 100 classes)
+## Path A — Neighborhood Residual (probe-gated)
+
+### When it activates
+
+This path activates only when query/reference class overlap is high and the matched class space is moderate (`<=40`).
+
+### Update rule
+
+For matched query cells:
+
+```python
+z' = z + 0.25 * (target_same_class_balanced - z)
+```
+
+`target_same_class_balanced` is computed from same-class reference neighbors, averaged across available batch domains (for example `assay`) to avoid assay-skewed targets.
+
+If matched neighbors are unavailable, it returns direct projection.
+
+This path is deterministic in current routing: once selected by probe+gate, it applies the fixed neighborhood step and returns.
+
+---
+
+## Path B — Neural Adapter (≤ 100 classes, when not routed to neighborhood)
 
 ### When it activates
 
@@ -35,23 +59,21 @@ Where:
 ### Training Objectives
 
 ```python
-# Per batch:
 loss_adapter = (
-    5.0  * adversarial_loss(D(z'), label=reference)   # Fool discriminator
-  + 5.0  * alignment(z_ref, z')                        # MMD + CORAL + Moments
-  + 10.0 * conditional_mmd(z_ref, z', cell_type)       # Per-cell-type alignment
-  + w_bio * bio_cross_entropy(BioClassifier(z'), y)     # Biology preservation
-  + 0.05 * recon_mse(Decoder(z'), Decoder(z))           # Information preservation
+    w_adv   * adversarial_loss
+  + w_align * global_alignment_loss      # MMD+moment+CORAL (or SWD mode)
+  + w_cond  * prototype_alignment_loss
+  + w_bio   * bio_classifier_loss        # if overlap is adequate
+  + w_recon * decoder_consistency_loss
+  + w_trust * trust_region_loss
 )
-
-loss_disc = cross_entropy(D(z_ref), ref) + cross_entropy(D(z'), query)
 ```
 
 `w_bio` scales automatically with class count and label overlap:
 
-| Classes | w_bio |
+| Classes | `w_bio` |
 |---------|-------|
-| ≤ 20 | 5.0 |
+| ≤ 20 | 2.0 |
 | ≤ 100 | 1.0 |
 | > 100 | N/A (analytical path) |
 | overlap < 30% | 0.0 (disabled — noisy gradients) |
@@ -63,14 +85,14 @@ loss_disc = cross_entropy(D(z_ref), ref) + cross_entropy(D(z'), query)
 - **Early stopping**: Patience on |disc_acc − 0.5| — stops when discriminator is maximally confused
 - **Best-state checkpoint**: Returns adapter weights from the epoch with disc_acc closest to 0.5
 
-### Default Hyperparameters
+### Typical Hyperparameters
 
 ```python
-adaptation_epochs = 300    # max training epochs
+adaptation_epochs = 120-300
 warmup_epochs     = 20     # LR ramp-up period
-patience          = 50     # early-stopping patience
-max_epochs        = 800    # hard cap
-learning_rate     = 0.001
+patience          = 25-50
+max_epochs        = 220-800
+learning_rate     = 0.0007-0.001
 adapter_dim       = 128    # hidden dim inside adapter
 ```
 
@@ -82,7 +104,7 @@ Pancreas dataset (14 cell types, 9 technologies):
 
 ---
 
-## Path B — Analytical Mean-Shift (> 100 classes)
+## Path C — Analytical Mean-Shift (> 100 classes)
 
 ### When it activates
 
@@ -156,7 +178,7 @@ adata_query_corrected = transform_query_adaptive(
     model=model,
     adata_query=adata_query,
     adata_reference=adata_reference,
-    bio_label='celltype',      # determines routing: ≤100 → neural, >100 → analytical
+    bio_label='celltype',      # routing uses probe threshold + overlap/class-count gate
     adaptation_epochs=300,
     warmup_epochs=20,
     patience=50,
@@ -174,12 +196,12 @@ adata_query_corrected.obsm['X_ScAdver']   # batch-corrected latent embeddings
 
 ## Limitations
 
-| | Neural path | Analytical path |
-|-|-------------|-----------------|
-| Classes | ≤ 100 | > 100 |
-| Requires bio_label | Optional (improves results) | Required (used for centroid grouping) |
-| Non-linear shift | ✅ Handled | ❌ Assumes translational shift per class |
-| Zero overlap | Falls back to direct projection | Falls back to global mean shift (warns) |
-| Orphan query classes | Aligned via distribution loss | Global mean shift |
+| | Direct | Neighborhood | Neural | Analytical |
+|-|--------|--------------|--------|------------|
+| Class regime | Any | Strong-overlap, `<=40` matched classes | `<=100` (when not routed to neighborhood) | `>100` |
+| Needs bio labels | No | Yes | Optional (recommended) | Yes |
+| Handles non-linear shift | Limited | Limited | ✅ | Limited |
+| Handles many orphan classes | Limited | Limited | Moderate | Global fallback |
+| Zero overlap behavior | N/A | Falls back to direct | Uses unsupervised losses / safeguard | Global mean shift with warning |
 
 ---

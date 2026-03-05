@@ -291,6 +291,31 @@ class EnhancedResidualAdapter(nn.Module):
             self.scale.data.clamp_(min=min_val, max=max_val)
 
 
+class NeighborhoodResidualAdapter(nn.Module):
+    """
+    Simple residual adapter that pulls query embeddings toward reference
+    neighborhood targets.
+
+    Given a latent embedding ``z`` and a same-class reference target ``t``,
+    the adapter applies:
+
+        z' = z + alpha * (t - z)
+
+    where ``alpha`` is a scalar in ``[0, 1]`` selected outside the module.
+    """
+
+    def __init__(self, alpha=1.0):
+        super().__init__()
+        self.alpha = float(alpha)
+
+    def forward(self, z, target):
+        return z + self.alpha * (target - z)
+
+    @property
+    def effective_alpha(self):
+        return self.alpha
+
+
 class DomainDiscriminator(nn.Module):
     """
     Domain discriminator for adversarial domain adaptation.

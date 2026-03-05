@@ -9,8 +9,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import silhouette_score
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import LabelEncoder
 
 from .losses import PrototypeAlignmentLoss, SlicedWassersteinLoss
 from .model import AdversarialBatchCorrector, EnhancedResidualAdapter, initialize_weights_deterministically
@@ -100,6 +101,146 @@ def _encode_labels_with_reference(labels, label_to_idx, unmatched_index=-100):
         'total_classes': total_classes,
     }
     return encoded, stats
+
+
+def _neighbor_mixing_score(embeddings, labels, k=15):
+    """Compute mean fraction of neighbors with a different label."""
+    labels = np.asarray(labels)
+    n_neighbors = min(k + 1, len(embeddings))
+    if n_neighbors <= 1:
+        return 0.0
+    nn = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean').fit(embeddings)
+    indices = nn.kneighbors(embeddings, return_distance=False)[:, 1:]
+    return float(np.mean([np.mean(labels[row] != labels[i]) for i, row in enumerate(indices)]))
+
+
+def _label_transfer_accuracy(ref_emb, query_emb, ref_labels, query_labels, k=15):
+    """kNN majority-vote label-transfer accuracy from reference to query."""
+    if len(ref_emb) == 0 or len(query_emb) == 0:
+        return float("nan")
+    nn = NearestNeighbors(n_neighbors=min(k, len(ref_emb)), metric='euclidean').fit(ref_emb)
+    neighbor_idx = nn.kneighbors(query_emb, return_distance=False)
+    ref_labels = np.asarray(ref_labels)
+    query_labels = np.asarray(query_labels)
+    correct = 0
+    for i, row in enumerate(neighbor_idx):
+        vals, cnts = np.unique(ref_labels[row], return_counts=True)
+        if vals[cnts.argmax()] == query_labels[i]:
+            correct += 1
+    return correct / len(query_labels)
+
+
+def _get_domain_mixing_labels(adata_reference, adata_query, ref_idx=None, query_idx=None):
+    """
+    Return fixed role labels for reference/query mixing checks.
+
+    Query projection is evaluated between one fixed reference and one incoming
+    query dataset at a time, so the relevant domain labels are simply the role
+    of each cell in that comparison.
+    """
+    n_ref = adata_reference.n_obs if ref_idx is None else len(ref_idx)
+    n_query = adata_query.n_obs if query_idx is None else len(query_idx)
+    ref_labels = np.repeat("reference", n_ref)
+    query_labels = np.repeat("query", n_query)
+    return "role", ref_labels, query_labels, False
+
+
+def _infer_balancing_label(adata_reference, adata_query, bio_label=None):
+    """Infer a batch-like label that is safe to use for balanced neighborhood targets."""
+    if adata_reference is None or adata_query is None:
+        return None
+
+    shared_cols = set(adata_reference.obs.columns).intersection(adata_query.obs.columns)
+    preferred = ('assay', 'batch')
+    for col in preferred:
+        if col in shared_cols and col != bio_label:
+            return col
+    return None
+
+
+def _build_reference_neighbor_targets(ref_embeddings, ref_labels, query_embeddings, query_labels,
+                                      k=5, ref_batch_labels=None):
+    """
+    Build same-class reference neighborhood targets for query embeddings.
+
+    Returns
+    -------
+    targets : ndarray, shape (n_query, d)
+        Per-query target latent locations. Unmatched classes keep their
+        original query embedding.
+    matched_mask : ndarray, shape (n_query,)
+        Whether a same-class reference neighborhood was available.
+    """
+    ref_labels = np.asarray(ref_labels).astype(str)
+    query_labels = np.asarray(query_labels).astype(str)
+    ref_batch_labels = None if ref_batch_labels is None else np.asarray(ref_batch_labels).astype(str)
+    targets = np.asarray(query_embeddings, dtype=np.float32).copy()
+    matched_mask = np.zeros(len(query_labels), dtype=bool)
+
+    for label in np.unique(query_labels):
+        q_idx = np.where(query_labels == label)[0]
+        r_idx = np.where(ref_labels == label)[0]
+        if len(q_idx) == 0 or len(r_idx) == 0:
+            continue
+
+        if ref_batch_labels is None:
+            n_neighbors = min(k, len(r_idx))
+            nn = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean').fit(ref_embeddings[r_idx])
+            neighbor_idx = nn.kneighbors(query_embeddings[q_idx], return_distance=False)
+            targets[q_idx] = ref_embeddings[r_idx][neighbor_idx].mean(axis=1)
+            matched_mask[q_idx] = True
+            continue
+
+        batch_targets = []
+        for batch in np.unique(ref_batch_labels[r_idx]):
+            batch_r_idx = r_idx[ref_batch_labels[r_idx] == batch]
+            if len(batch_r_idx) == 0:
+                continue
+            n_neighbors = min(k, len(batch_r_idx))
+            nn = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean').fit(ref_embeddings[batch_r_idx])
+            neighbor_idx = nn.kneighbors(query_embeddings[q_idx], return_distance=False)
+            batch_targets.append(ref_embeddings[batch_r_idx][neighbor_idx].mean(axis=1))
+
+        if batch_targets:
+            targets[q_idx] = np.mean(batch_targets, axis=0)
+            matched_mask[q_idx] = True
+
+    return targets, matched_mask
+
+
+def _evaluate_query_projection(ref_embeddings, query_embeddings, ref_labels, query_labels,
+                               ref_domain_labels=None, query_domain_labels=None, domain_use_ref_ceiling=False, k=15):
+    """Evaluate LTA plus optional domain-mixing statistics for a query projection."""
+    metrics = {
+        'lta': None,
+        'mix': None,
+        'mix_floor': None,
+        'score': None,
+    }
+
+    if ref_labels is not None and query_labels is not None:
+        metrics['lta'] = _label_transfer_accuracy(
+            ref_emb=ref_embeddings,
+            query_emb=query_embeddings,
+            ref_labels=ref_labels,
+            query_labels=query_labels,
+            k=k,
+        )
+
+    if ref_domain_labels is not None and query_domain_labels is not None:
+        metrics['mix'] = _neighbor_mixing_score(
+            np.vstack([ref_embeddings, query_embeddings]),
+            np.concatenate([ref_domain_labels, query_domain_labels]),
+            k=k,
+        )
+        if domain_use_ref_ceiling:
+            ref_ceiling = _neighbor_mixing_score(ref_embeddings, ref_domain_labels, k=k)
+            metrics['mix_floor'] = ref_ceiling * 0.90
+
+    lta_term = 0.0 if metrics['lta'] is None else metrics['lta']
+    mix_term = 0.0 if metrics['mix'] is None else metrics['mix']
+    metrics['score'] = lta_term + 0.5 * mix_term
+    return metrics
 
 
 def _analytical_mean_shift(z_query_all_np, z_ref_np, query_ct_raw, ref_ct_indices, min_query_cells=3):
@@ -363,7 +504,7 @@ def _run_large_scale_refinement(
 def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=None, query_data=None, 
                                    latent_dim=256, epochs=500, learning_rate=0.001, 
                                    bio_weight='auto', batch_weight=0.5, device='auto', 
-                                   return_reconstructed=False, seed=42):
+                                   return_reconstructed=False, calculate_metrics=True, seed=42):
     """
     Adversarial Batch Correction
     
@@ -408,6 +549,10 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     return_reconstructed : bool, default=False
         If True, returns batch-corrected reconstructed gene expression in adata.layers['ScAdver_reconstructed']
         If False (default), only returns latent embeddings in adata.obsm['X_ScAdver']
+    calculate_metrics : bool, default=True
+        If True, computes and prints silhouette-based reference metrics
+        (`biology_preservation`, `batch_correction`, etc.). Set to False
+        for a cleaner training log when you only need corrected outputs.
         
     Returns:
     --------
@@ -593,6 +738,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     
     print(f"   Batch size (adaptive): {batch_size} ({n_train // batch_size} batches/epoch for {n_train:,} samples)")
     best_bio_acc = 0.0
+    monitor_every = max(1, min(100, epochs // 5 if epochs >= 5 else 1))
     
     for epoch in range(epochs):
         model.train()
@@ -672,7 +818,7 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
                 source_opt.step()
         
         # Progress monitoring - evaluate on training data (Reference samples only)
-        if (epoch + 1) % 100 == 0:
+        if (epoch + 1) % monitor_every == 0 or (epoch + 1) == epochs:
             model.eval()
             with torch.no_grad():
                 if model.source_discriminator is not None:
@@ -687,11 +833,11 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
                 print(f"   Epoch {epoch+1}/{epochs} - Bio accuracy (Reference): {bio_acc:.3f} (best: {best_bio_acc:.3f})")
     
     if has_source_split:
-        print(f"✅ Training completed! Best biology accuracy on Reference: {best_bio_acc:.3f}")
+        print(f"✅ Training completed! Best monitored biology accuracy on Reference: {best_bio_acc:.3f}")
         print(f"   🎯 Model trained ONLY on {X_train.shape[0]} Reference samples")
         print(f"   🚀 Now applying to ALL {X.shape[0]} samples (Reference + Query)")
     else:
-        print(f"✅ Training completed! Best biology accuracy: {best_bio_acc:.3f}")
+        print(f"✅ Training completed! Best monitored biology accuracy: {best_bio_acc:.3f}")
     
     # Generate corrected embedding
     print("🔄 GENERATING CORRECTED EMBEDDING:")
@@ -726,45 +872,47 @@ def adversarial_batch_correction(adata, bio_label, batch_label, reference_data=N
     else:
         print(f"   💡 Tip: Set return_reconstructed=True to get batch-corrected gene expression matrix")
     
-    # Calculate metrics
-    print("📊 CALCULATING PERFORMANCE METRICS:")
-    
-    # Use valid samples for evaluation
-    X_eval = corrected_embedding[valid_mask]
-    bio_eval = adata_clean.obs[bio_label]
-    batch_eval = adata_clean.obs[batch_label]
-    
-    # Biology preservation (higher is better)
-    bio_sil = silhouette_score(X_eval, bio_eval)
-    bio_score = (bio_sil + 1) / 2
-    
-    # Batch mixing: silhouette_score in [-1,1]; lower = better mixing.
-    # Map so that sil=-1 (perfect mix) → 1.0, sil=+1 (no mix) → 0.0.
-    # Clamp to [0, 1] — the raw formula can exceed 1 when sil < 0.
-    batch_sil = silhouette_score(X_eval, batch_eval)
-    batch_score = float(np.clip((1 - batch_sil) / 2, 0.0, 1.0))
-    
-    metrics = {
-        'biology_preservation': bio_score,
-        'batch_correction': batch_score,
-        'overall_score': 0.6 * bio_score + 0.4 * batch_score,
-        'biology_silhouette': bio_sil,
-        'batch_silhouette': batch_sil
-    }
-    
-    if has_source_split and 'Source' in adata_clean.obs.columns:
-        source_eval = adata_clean.obs['Source']
-        source_sil = silhouette_score(X_eval, source_eval)
-        source_score = float(np.clip((1 - source_sil) / 2, 0.0, 1.0))
-        metrics['source_integration'] = source_score
-        metrics['source_silhouette'] = source_sil
-        metrics['overall_score'] = 0.4 * bio_score + 0.3 * batch_score + 0.3 * source_score
-    
-    print(f"   Biology preservation: {metrics['biology_preservation']:.4f}")
-    print(f"   Batch correction: {metrics['batch_correction']:.4f}")
-    if 'source_integration' in metrics:
-        print(f"   Source integration: {metrics['source_integration']:.4f}")
-    print(f"   Overall score: {metrics['overall_score']:.4f}")
+    metrics = {}
+    if calculate_metrics:
+        # Calculate metrics
+        print("📊 CALCULATING PERFORMANCE METRICS:")
+        
+        # Use valid samples for evaluation
+        X_eval = corrected_embedding[valid_mask]
+        bio_eval = adata_clean.obs[bio_label]
+        batch_eval = adata_clean.obs[batch_label]
+        
+        # Biology preservation (higher is better)
+        bio_sil = silhouette_score(X_eval, bio_eval)
+        bio_score = (bio_sil + 1) / 2
+        
+        # Batch mixing: silhouette_score in [-1,1]; lower = better mixing.
+        # Map so that sil=-1 (perfect mix) → 1.0, sil=+1 (no mix) → 0.0.
+        # Clamp to [0, 1] — the raw formula can exceed 1 when sil < 0.
+        batch_sil = silhouette_score(X_eval, batch_eval)
+        batch_score = float(np.clip((1 - batch_sil) / 2, 0.0, 1.0))
+        
+        metrics = {
+            'biology_preservation': bio_score,
+            'batch_correction': batch_score,
+            'overall_score': 0.6 * bio_score + 0.4 * batch_score,
+            'biology_silhouette': bio_sil,
+            'batch_silhouette': batch_sil
+        }
+        
+        if has_source_split and 'Source' in adata_clean.obs.columns:
+            source_eval = adata_clean.obs['Source']
+            source_sil = silhouette_score(X_eval, source_eval)
+            source_score = float(np.clip((1 - source_sil) / 2, 0.0, 1.0))
+            metrics['source_integration'] = source_score
+            metrics['source_silhouette'] = source_sil
+            metrics['overall_score'] = 0.4 * bio_score + 0.3 * batch_score + 0.3 * source_score
+        
+        print(f"   Biology preservation: {metrics['biology_preservation']:.4f}")
+        print(f"   Batch correction: {metrics['batch_correction']:.4f}")
+        if 'source_integration' in metrics:
+            print(f"   Source integration: {metrics['source_integration']:.4f}")
+        print(f"   Overall score: {metrics['overall_score']:.4f}")
     
     # Store encoders and architecture kwargs on model for save/load
     model.bio_encoder = bio_encoder
@@ -892,19 +1040,17 @@ def load_model(path, device='auto'):
     return model
 
 
-def detect_domain_shift(model, adata_query, adata_reference, bio_label=None, device='auto', 
-                       n_samples=1000, adaptation_epochs=30, learning_rate=0.001, seed=42):
+def detect_domain_shift(model, adata_query, adata_reference, bio_label=None, device='auto',
+                       n_samples=1000, adaptation_epochs=30, learning_rate=0.001,
+                       seed=42, alignment_mode='auto'):
     """
-    Automatically detect domain shift by training a residual adapter and measuring its magnitude.
-    
-    Instead of using statistical metrics (MMD, variance, distribution distances), this approach:
-    1. Trains a residual adapter R in adaptive mode for a few epochs
-    2. Measures the magnitude of residual corrections: ||R(z)||
-    3. If R ≈ 0, no domain shift exists (domains are similar)
-    4. If R > 0, domain shift exists (adapter is needed)
-    
-    This method is more principled because it directly tests whether adaptation is necessary
-    by letting the adapter itself determine if corrections are needed.
+    Detect domain shift using a raw latent-space distance between reference and query.
+
+    For supervised low-class settings we compute a same-class reference-neighborhood
+    target for each query cell and measure the average latent correction needed to
+    move query onto the reference manifold. This is the reported raw distance.
+
+    For unsupervised settings we fall back to the global latent mean offset.
     
     Parameters:
     -----------
@@ -932,203 +1078,132 @@ def detect_domain_shift(model, adata_query, adata_reference, bio_label=None, dev
     dict : Dictionary with detection results
         - 'needs_adapter': bool, whether adapter is recommended
         - 'adapter_dim': int, recommended adapter dimension (0 or 128)
-        - 'residual_magnitude': float, average L2 norm of residual corrections
-        - 'residual_std': float, std of residual magnitudes across samples
+        - 'residual_magnitude': float, raw latent domain distance
+        - 'residual_std': float, std of per-cell raw distances
         - 'confidence': str, confidence level ('high', 'medium', 'low')
+        - 'recommended_mode': str, suggested adapter mode ('neighbor' or alignment_mode)
     """
-    from .model import EnhancedResidualAdapter, DomainDiscriminator, initialize_weights_deterministically
-    
-    # Reproducibility
     set_global_seed(seed)
-    
     device = _resolve_device(device)
-    
     model = model.to(device)
     model.eval()
-    
-    # Freeze model parameters
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    # Deterministic subsampling
+
     rng = np.random.RandomState(seed)
     n_query = min(n_samples, adata_query.shape[0])
     n_ref = min(n_samples, adata_reference.shape[0])
-    
     query_idx = rng.choice(adata_query.shape[0], n_query, replace=False)
     ref_idx = rng.choice(adata_reference.shape[0], n_ref, replace=False)
-    
-    # Prepare data
+
     X_query = adata_query.X[query_idx].copy()
     X_ref = adata_reference.X[ref_idx].copy()
-    
     if hasattr(X_query, 'toarray'):
         X_query = X_query.toarray()
     if hasattr(X_ref, 'toarray'):
         X_ref = X_ref.toarray()
-    
     X_query = X_query.astype(np.float32)
     X_ref = X_ref.astype(np.float32)
-    
     X_query_tensor = torch.FloatTensor(X_query).to(device)
     X_ref_tensor = torch.FloatTensor(X_ref).to(device)
-    
-    # Get latent dimension
+
     with torch.no_grad():
-        z_sample = model.encoder(X_query_tensor[:10])
-        latent_dim = z_sample.shape[1]
-    
-    # Initialize a test residual adapter with deterministic init
-    adapter_dim = 128
-    set_global_seed(seed + 1)
-    adapter = EnhancedResidualAdapter(latent_dim, adapter_dim, n_layers=3, seed=seed + 1).to(device)
-    domain_disc = DomainDiscriminator(latent_dim).to(device)
-    initialize_weights_deterministically(domain_disc, seed=seed + 2)
-    
-    # Optimizers
-    optimizer_adapter = optim.Adam(adapter.parameters(), lr=learning_rate, eps=1e-7)
-    optimizer_disc = optim.Adam(domain_disc.parameters(), lr=learning_rate, eps=1e-7)
-    
-    # Prepare biological labels if provided
-    bio_loss_fn = None
-    bio_labels_tensor = None
-    detect_bio_weight = 0.0
-    if bio_label is not None and bio_label in adata_query.obs.columns:
-        label_to_idx = _get_reference_label_lookup(model, adata_reference, bio_label)
-        if label_to_idx is not None:
-            query_labels = adata_query.obs.iloc[query_idx][bio_label].astype(str)
-            encoded_labels, label_stats = _encode_labels_with_reference(query_labels, label_to_idx)
-            if label_stats['matched_class_ratio'] >= 0.3 and label_stats['matched_cell_ratio'] >= 0.3:
-                bio_labels_tensor = torch.LongTensor(encoded_labels).to(device)
-                bio_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
-                n_det_classes = len(label_stats['matched_classes'])
-                # Same adaptive scaling as main path
-                if n_det_classes <= 20:
-                    detect_bio_weight = 5.0
-                elif n_det_classes <= 100:
-                    detect_bio_weight = 1.0
-                elif n_det_classes <= 500:
-                    detect_bio_weight = 0.2
-                else:
-                    detect_bio_weight = 0.02
-    
-    # Quick training loop to test if adapter learns meaningful corrections
-    batch_size = 128
-    set_global_seed(seed + 3)
-    
-    for epoch in range(adaptation_epochs):
-        adapter.train()
-        domain_disc.train()
-        
-        n_samples_train = X_query_tensor.shape[0]
-        g = torch.Generator()
-        g.manual_seed(seed + 100 + epoch)
-        indices = torch.randperm(n_samples_train, generator=g)
-        
-        for i in range(0, n_samples_train, batch_size):
-            batch_idx = indices[i:i+batch_size]
-            X_batch = X_query_tensor[batch_idx]
-            
-            # Train Domain Discriminator
-            optimizer_disc.zero_grad()
-            with torch.no_grad():
-                z_query = model.encoder(X_batch)
-                z_query_adapted = adapter(z_query)
-                ref_batch_idx = torch.randint(0, X_ref_tensor.shape[0], (len(batch_idx),))
-                X_ref_batch = X_ref_tensor[ref_batch_idx]
-                z_ref = model.encoder(X_ref_batch)
-            
-            domain_pred_ref = domain_disc(z_ref)
-            domain_pred_query = domain_disc(z_query_adapted)
-            domain_labels_ref = torch.zeros(len(z_ref), dtype=torch.long, device=device)
-            domain_labels_query = torch.ones(len(z_query_adapted), dtype=torch.long, device=device)
-            loss_disc = nn.CrossEntropyLoss()(domain_pred_ref, domain_labels_ref) + \
-                       nn.CrossEntropyLoss()(domain_pred_query, domain_labels_query)
-            loss_disc.backward()
-            torch.nn.utils.clip_grad_norm_(domain_disc.parameters(), max_norm=1.0)
-            optimizer_disc.step()
-            
-            # Train Adapter
-            optimizer_adapter.zero_grad()
-            with torch.no_grad():
-                z_query = model.encoder(X_batch)
-            z_query_adapted = adapter(z_query)
-            
-            # Adversarial loss (fool discriminator)
-            domain_pred = domain_disc(z_query_adapted)
-            domain_labels_fake = torch.zeros(len(z_query_adapted), dtype=torch.long, device=device)
-            loss_adversarial = nn.CrossEntropyLoss()(domain_pred, domain_labels_fake)
-            
-            # Biological preservation loss (if available)
-            if bio_labels_tensor is not None:
-                bio_batch_labels = bio_labels_tensor[batch_idx]
-                bio_pred = model.bio_classifier(z_query_adapted)
-                loss_bio = bio_loss_fn(bio_pred, bio_batch_labels)
-            else:
-                loss_bio = torch.tensor(0.0, device=device)
-            
-            # Reconstruction loss
-            with torch.no_grad():
-                recon_orig = model.decoder(z_query)
-            recon_adapted = model.decoder(z_query_adapted)
-            loss_recon = nn.MSELoss()(recon_adapted, recon_orig)
-            
-            # Combined loss
-            loss_adapter = loss_adversarial + detect_bio_weight * loss_bio + 0.1 * loss_recon
-            loss_adapter.backward()
-            torch.nn.utils.clip_grad_norm_(adapter.parameters(), max_norm=1.0)
-            optimizer_adapter.step()
-    
-    # Evaluate the residual magnitude
-    adapter.eval()
-    residual_magnitudes = []
-    
-    with torch.no_grad():
-        for i in range(0, len(X_query_tensor), batch_size):
-            X_batch = X_query_tensor[i:i+batch_size]
-            z_batch = model.encoder(X_batch)
-            z_adapted_batch = adapter(z_batch)
-            
-            # Compute residual: R(z) = z_adapted - z
-            residual = z_adapted_batch - z_batch
-            # Compute L2 norm for each sample
-            residual_norm = torch.norm(residual, p=2, dim=1)
-            residual_magnitudes.append(residual_norm.cpu().numpy())
-    
-    residual_magnitudes = np.concatenate(residual_magnitudes)
-    residual_mean = residual_magnitudes.mean()
-    residual_std = residual_magnitudes.std()
-    
-    # Decision threshold: Simple rule based on residual magnitude
-    # R ≈ 0: No domain shift, no adaptation needed
-    # R > 0: Domain shift exists, use adapter
-    # Use small threshold (0.1) to account for numerical noise
-    threshold = 0.1
-    
-    if residual_mean > threshold:
-        needs_adapter = True
-        adapter_dim_recommended = 128
-        confidence = 'high' if residual_mean > 1.0 else 'medium'
+        z_ref_all = model.encoder(X_ref_tensor)
+        z_query_all = model.encoder(X_query_tensor)
+
+    z_ref_np = z_ref_all.detach().cpu().numpy()
+    z_query_np = z_query_all.detach().cpu().numpy()
+
+    query_label_array = None
+    ref_label_array = None
+    recommended_mode = alignment_mode
+    raw_targets = None
+    matched_mask = None
+    balancing_label = _infer_balancing_label(adata_reference, adata_query, bio_label=bio_label)
+    ref_balance_array = None
+
+    if bio_label is not None and bio_label in adata_query.obs.columns and bio_label in adata_reference.obs.columns:
+        query_label_array = np.asarray(adata_query.obs.iloc[query_idx][bio_label]).astype(str)
+        ref_label_array = np.asarray(adata_reference.obs.iloc[ref_idx][bio_label]).astype(str)
+        if balancing_label is not None:
+            ref_balance_array = np.asarray(adata_reference.obs.iloc[ref_idx][balancing_label]).astype(str)
+        raw_targets, matched_mask = _build_reference_neighbor_targets(
+            ref_embeddings=z_ref_np,
+            ref_labels=ref_label_array,
+            query_embeddings=z_query_np,
+            query_labels=query_label_array,
+            k=5,
+            ref_batch_labels=ref_balance_array,
+        )
+        if matched_mask.any():
+            deltas = raw_targets[matched_mask] - z_query_np[matched_mask]
+            residual_norms = np.linalg.norm(deltas, axis=1)
+            residual_mean = float(residual_norms.mean())
+            residual_std = float(residual_norms.std())
+            shared_ratio = float(matched_mask.mean())
+            n_classes = len(np.unique(query_label_array[matched_mask]))
+            if alignment_mode == 'auto' and shared_ratio >= 0.8 and n_classes <= 40:
+                recommended_mode = 'neighbor'
+        else:
+            residuals = z_ref_np.mean(axis=0, keepdims=True) - z_query_np
+            residual_norms = np.linalg.norm(residuals, axis=1)
+            residual_mean = float(residual_norms.mean())
+            residual_std = float(residual_norms.std())
     else:
-        needs_adapter = False
-        adapter_dim_recommended = 0
-        confidence = 'high'
-    
-    result = {
+        residuals = z_ref_np.mean(axis=0, keepdims=True) - z_query_np
+        residual_norms = np.linalg.norm(residuals, axis=1)
+        residual_mean = float(residual_norms.mean())
+        residual_std = float(residual_norms.std())
+
+    domain_col, ref_domain_labels, query_domain_labels, use_ref_ceiling = _get_domain_mixing_labels(
+        adata_reference,
+        adata_query,
+        ref_idx=ref_idx,
+        query_idx=query_idx,
+    )
+    direct_eval = _evaluate_query_projection(
+        ref_embeddings=z_ref_np,
+        query_embeddings=z_query_np,
+        ref_labels=ref_label_array,
+        query_labels=query_label_array,
+        ref_domain_labels=ref_domain_labels,
+        query_domain_labels=query_domain_labels,
+        domain_use_ref_ceiling=use_ref_ceiling,
+        k=15,
+    )
+
+    needs_adapter = residual_mean > 0.1
+    confidence = 'high' if residual_mean > 0.5 else 'medium'
+    if direct_eval['mix_floor'] is not None and direct_eval['mix'] is not None:
+        confidence = 'high' if residual_mean > 0.1 and direct_eval['mix'] < direct_eval['mix_floor'] else confidence
+
+    if alignment_mode not in ('auto', 'mmd', 'swd', 'neighbor'):
+        raise ValueError("alignment_mode must be one of {'auto', 'mmd', 'swd', 'neighbor'}")
+
+    return {
         'needs_adapter': needs_adapter,
-        'adapter_dim': adapter_dim_recommended,
-        'residual_magnitude': float(residual_mean),
-        'residual_std': float(residual_std),
-        'confidence': confidence
+        'adapter_dim': 128 if needs_adapter else 0,
+        'residual_magnitude': residual_mean,
+        'residual_std': residual_std,
+        'confidence': confidence,
+        'probe_direct_lta': None if direct_eval['lta'] is None else float(direct_eval['lta']),
+        'probe_adapted_lta': None,
+        'probe_direct_mix': None if direct_eval['mix'] is None else float(direct_eval['mix']),
+        'probe_adapted_mix': None,
+        'probe_ref_mix_ceiling': None if direct_eval['mix_floor'] is None else float(direct_eval['mix_floor']),
+        'recommended_mode': recommended_mode,
+        'raw_domain_metric': (
+            f'same-class balanced-neighbor distance ({balancing_label})'
+            if balancing_label is not None and raw_targets is not None and matched_mask is not None and matched_mask.any()
+            else 'same-class neighbor distance' if raw_targets is not None and matched_mask is not None and matched_mask.any()
+            else 'global mean offset'
+        ),
     }
-    
-    return result
 
 
 def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None,
                             adaptation_epochs=200, learning_rate=0.0005,
                             warmup_epochs=50, patience=30, max_epochs=None,
-                            device='auto', return_reconstructed=False, seed=42):
+                            device='auto', return_reconstructed=False, seed=42,
+                            alignment_mode='auto'):
     """
     Automatic query projection with intelligent domain adaptation.
     
@@ -1138,7 +1213,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     
     * **Multi-loss alignment** — MMD, CORAL, moment-matching, and adversarial
       losses align query embeddings to the reference latent space.
-    * **Gradual warmup** — adapter strength ramps linearly from 0.5→1.0 over
+    * **Gradual warmup** — residual strength ramps from 0→1 over
       ``warmup_epochs`` to avoid sudden shifts.
     * **Cosine-annealing LR** — learning rate decays smoothly for stable
       convergence.
@@ -1182,6 +1257,10 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         Return batch-corrected gene expression.
     seed : int, default=42
         Random seed for full reproducibility.
+    alignment_mode : {'auto', 'mmd', 'swd'}, default='auto'
+        Alignment loss stack for the neural adapter path. ``'auto'`` keeps the
+        default public behavior (MMD + moment matching + CORAL). ``'swd'`` is
+        a lighter experimental option for coarse meta-class problems.
     
     Returns
     -------
@@ -1199,7 +1278,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     ... )
     """
     
-    from .model import (EnhancedResidualAdapter, DomainDiscriminator,
+    from .model import (EnhancedResidualAdapter, NeighborhoodResidualAdapter, DomainDiscriminator,
                         initialize_weights_deterministically)
     from .losses import AlignmentLossComputer
     
@@ -1242,17 +1321,24 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         detection_result = detect_domain_shift(
             model, adata_query, adata_reference,
             bio_label=bio_label, device=device, seed=seed,
+            alignment_mode=alignment_mode,
         )
         adapter_dim = detection_result['adapter_dim']
+        effective_alignment_mode = detection_result.get('recommended_mode', alignment_mode)
         print(f"   📊 Residual Probe Analysis:")
-        print(f"      ||R(z)||: {detection_result['residual_magnitude']:.4f}  "
+        metric_label = detection_result.get('raw_domain_metric', 'raw domain distance')
+        print(f"      ||Δ(z)||: {detection_result['residual_magnitude']:.4f}  "
               f"(std {detection_result['residual_std']:.4f})")
+        print(f"      Metric   : {metric_label}")
         print(f"   🎯 Decision: {'ADAPTER NEEDED' if detection_result['needs_adapter'] else 'DIRECT PROJECTION — shift negligible'}")
         print(f"      Confidence: {detection_result['confidence'].upper()}")
         if detection_result['needs_adapter']:
-            print(f"   💡 ||R|| > 0.1: domain shift detected — training neural adapter")
+            print(f"   💡 ||Δ|| > 0.1: raw source shift detected — adapting query toward the reference manifold")
         else:
-            print(f"   ✅ ||R|| ≈ 0: domains already aligned — using frozen encoder directly")
+            print(f"   ✅ ||Δ|| ≤ 0.1: domains already close — using frozen encoder directly")
+        if detection_result.get('recommended_mode') not in (None, alignment_mode):
+            print(f"   🔀 Adapter mode: {detection_result['recommended_mode']}")
+    effective_alignment_mode = detection_result.get('recommended_mode', alignment_mode) if not _skip_probe else alignment_mode
     print()
 
     use_adapter = adapter_dim > 0
@@ -1334,9 +1420,19 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         # remapping, and grows from there if needed.
         init_scale = 0.05
     else:
-        # STANDARD: scale to cover ~80% of the detected shift so the
-        # adapter can produce corrections of the right order from epoch 1.
-        init_scale = max(residual_mag * 0.8, 0.1)
+        # STANDARD: keep the adapter conservative. The residual probe is only
+        # used to detect whether a query shift exists, not to force a large
+        # initial correction. Large initial scales can overrun a strong frozen
+        # encoder on atlas-style datasets.
+        init_scale = min(max(residual_mag * 0.05, 0.02), 0.20)
+    if _large_scale:
+        min_scale = 0.01
+        max_scale = 0.20
+    else:
+        min_scale = 0.0
+        max_scale = max(0.35, init_scale * 2.0)
+        if effective_alignment_mode == 'swd' and _n_ct_early <= 50:
+            max_scale = max(max_scale, 0.55)
 
     # 4c. Reference data
     if adata_reference is not None:
@@ -1381,9 +1477,9 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
             print(f"   ⚠️  Bio classifier DISABLED — {regime_reason}")
         else:
             if n_query_classes <= 20:
-                adaptive_bio_weight = 0.5
+                adaptive_bio_weight = 2.0
             else:
-                adaptive_bio_weight = 0.2
+                adaptive_bio_weight = 1.0
 
             bio_labels_tensor = torch.LongTensor(encoded_labels).to(device)
             bio_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
@@ -1397,6 +1493,8 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     # Pre-compute reference latent embeddings (frozen encoder)
     z_ref_all = None
     ref_ct_indices = {}   # cell-type → list of indices into z_ref_all
+    reference_prototypes = {}
+    prototype_loss = None
     if X_ref_tensor is not None:
         with torch.no_grad():
             z_ref_all = model.encoder(X_ref_tensor)
@@ -1407,6 +1505,15 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
             for ct in np.unique(ref_ct_array):
                 ref_ct_indices[ct] = np.where(ref_ct_array == ct)[0]
             print(f"   Conditional alignment: {len(ref_ct_indices)} cell types indexed")
+            if not _large_scale:
+                reference_prototypes = {
+                    ct: z_ref_all[idx].mean(dim=0).detach()
+                    for ct, idx in ref_ct_indices.items()
+                    if len(idx) >= 16
+                }
+                if reference_prototypes:
+                    prototype_loss = PrototypeAlignmentLoss(min_samples=4).to(device)
+                    print(f"   Prototype anchors  : {len(reference_prototypes)} class centroids")
     
     # ------------------------------------------------------------------
     # 5. TWO-PATH DESIGN — WHY TWO PATHS?
@@ -1498,6 +1605,80 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         print("   Output: adata.obsm['X_ScAdver'] (analytical mean-shift with optional micro-refinement)")
         return adata_corrected
 
+    if effective_alignment_mode == 'neighbor' and z_ref_all is not None and query_ct_raw is not None:
+        print("\n🧭 NEIGHBOR RESIDUAL MODE: Same-class reference neighborhood pull")
+        print(f"   {_n_ct_early} classes ≤ 100 with strong label overlap → simplified residual adapter")
+
+        with torch.no_grad():
+            z_query_tensor_full = model.encoder(X_query_tensor)
+            z_query_np = z_query_tensor_full.cpu().numpy()
+        z_ref_np = z_ref_all.detach().cpu().numpy()
+        ref_labels_eval = np.asarray(adata_reference.obs[bio_label]).astype(str)
+        query_labels_eval = np.asarray(query_ct_raw).astype(str)
+        balance_col = _infer_balancing_label(adata_reference, adata_query, bio_label=bio_label)
+        ref_balance_eval = None if balance_col is None else np.asarray(adata_reference.obs[balance_col]).astype(str)
+
+        target_np, matched_mask = _build_reference_neighbor_targets(
+            ref_embeddings=z_ref_np,
+            ref_labels=ref_labels_eval,
+            query_embeddings=z_query_np,
+            query_labels=query_labels_eval,
+            k=5,
+            ref_batch_labels=ref_balance_eval,
+        )
+
+        if not matched_mask.any():
+            print("   ⚠️  No same-class reference neighborhoods found — returning direct projection.")
+            adata_corrected = adata_query.copy()
+            adata_corrected.obsm['X_ScAdver'] = z_query_np
+            if return_reconstructed:
+                with torch.no_grad():
+                    recon_np = model.decoder(z_query_tensor_full).cpu().numpy()
+                adata_corrected.layers['ScAdver_reconstructed'] = recon_np
+                print(f"   ✅ Reconstructed expression: {recon_np.shape}")
+            print("   ↩️  Direct projection returned (neighbor targets unavailable)")
+            return adata_corrected
+        else:
+            target_delta = target_np[matched_mask] - z_query_np[matched_mask]
+            raw_distance = np.linalg.norm(target_delta, axis=1).mean()
+            print(f"   Raw same-class shift  : {raw_distance:.4f}")
+            print(f"   Matched query cells   : {matched_mask.mean():.1%}")
+            if balance_col is not None:
+                print(f"   Balanced targets      : same-class neighbors averaged across {balance_col}")
+            alpha = 0.25
+            adapter = NeighborhoodResidualAdapter(alpha=alpha)
+            adapted_np = z_query_np.copy()
+            adapted_np[matched_mask] = adapter(
+                torch.as_tensor(z_query_np[matched_mask], dtype=torch.float32),
+                torch.as_tensor(target_np[matched_mask], dtype=torch.float32),
+            ).cpu().numpy()
+
+            # Keep a small jitter to avoid exact manifold collapse.
+            rng = np.random.default_rng(seed + 901)
+            adapted_np[matched_mask] += 0.01 * rng.normal(size=adapted_np[matched_mask].shape)
+
+            print(f"   Applied alpha         : {alpha:.2f}")
+            adata_corrected = adata_query.copy()
+            adata_corrected.obsm['X_ScAdver'] = adapted_np
+            if return_reconstructed:
+                adapted_tensor = torch.as_tensor(adapted_np, dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    recon_np = model.decoder(adapted_tensor).cpu().numpy()
+                adata_corrected.layers['ScAdver_reconstructed'] = recon_np
+                print(f"   ✅ Reconstructed expression: {recon_np.shape}")
+            print("   ✅ Returning neighborhood residual projection")
+            return adata_corrected
+
+    if effective_alignment_mode not in ('auto', 'mmd', 'swd', 'neighbor'):
+        raise ValueError("alignment_mode must be one of {'auto', 'mmd', 'swd', 'neighbor'}")
+    use_swd_alignment = effective_alignment_mode == 'swd'
+    alignment_loss = None
+    swd_loss = None
+    if use_swd_alignment:
+        swd_loss = SlicedWassersteinLoss(n_projections=64).to(device)
+    else:
+        alignment_loss = AlignmentLossComputer(mmd_weight=1.0, moment_weight=0.5, coral_weight=0.3).to(device)
+
     # 4e. Instantiate adapter + discriminator with deterministic init
     adapter = EnhancedResidualAdapter(
         latent_dim,
@@ -1506,7 +1687,8 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         dropout=0.1,
         init_scale=init_scale,
         seed=seed + 11,
-        min_scale=init_scale * 0.5,
+        min_scale=min_scale,
+        max_scale=max_scale,
     ).to(device)
     disc_hidden = 256
     domain_disc = DomainDiscriminator(latent_dim, hidden_dim=disc_hidden, dropout=0.3).to(device)
@@ -1515,7 +1697,8 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     print(f"\n🏗️  Initializing enhanced residual adapter...")
     print(f"   Architecture: {latent_dim} → [{adapter_dim}]*3 → {latent_dim}  (unbounded residual, learnable scale)")
     print(f"   Domain shift magnitude : {residual_mag:.4f}")
-    print(f"   Adapter init_scale     : {init_scale:.4f}  (80% of shift)")
+    print(f"   Adapter init_scale     : {init_scale:.4f}")
+    print(f"   Adapter scale bounds   : [{min_scale:.4f}, {max_scale:.4f}]")
     print(f"   Initial adapter scale  : {adapter.effective_scale:.4f}")
 
     # 4f. Optimisers with cosine annealing
@@ -1533,9 +1716,6 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         optimizer_disc, T_0=_T0, T_mult=2, eta_min=learning_rate * 0.01,
     )
 
-    # 4g. Alignment losses
-    alignment_loss = AlignmentLossComputer(mmd_weight=1.0, moment_weight=0.5, coral_weight=0.3).to(device)
-
     # ------------------------------------------------------------------
     # 6. Neural adapter training loop  (≤100 classes: cross-technology datasets)
     # Adversarial + alignment + conditional MMD; handles non-linear tech shifts.
@@ -1545,7 +1725,6 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     print(f"\n🏋️  NEURAL ADAPTER MODE: Training enhanced residual adapter...")
     print(f"   {_n_ct_early} classes \u2264 100 \u2192 cross-technology neural path (validated for cell-type atlases)")
     print(f"   Epochs: {adaptation_epochs}  |  Max: {_max_epochs}  |  Warmup: {warmup_epochs}  |  Patience: {patience}")
-    print("   Losses: adversarial(×5) + alignment(×5) + conditional(×10) + bio + reconstruction")
     
     # Adaptive batch size: larger datasets use bigger batches to prevent the
     # discriminator from getting 1000+ updates/epoch and overwhelming the adapter.
@@ -1559,12 +1738,40 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     else:
         batch_size = 512
     
-    n_batches_per_epoch = n_total // batch_size
-    # Use 2 disc steps for small class counts (disc needs to stay ahead of adapter).
-    # For large class counts (>100) the discriminator is already very powerful —
-    # 1 step keeps training balanced and gives the adapter equal gradient time.
-    n_ct_total_for_steps = len(ref_ct_indices) if ref_ct_indices else 0
-    n_disc_steps = 1 if n_ct_total_for_steps > 100 else 2
+    n_batches_per_epoch = max(1, (n_total + batch_size - 1) // batch_size)
+    # Coarse meta-class problems need more adversarial pressure and a looser
+    # trust region than well-behaved atlas transfers such as pancreas.
+    if _n_ct_early <= 20:
+        if use_swd_alignment:
+            adv_w, align_w, cond_w = 3.0, 0.9, 1.5
+            recon_weight, trust_weight = 0.02, 0.15
+        else:
+            adv_w, align_w, cond_w = 3.0, 1.5, 2.0
+            recon_weight, trust_weight = 0.03, 0.20
+        n_disc_steps = 2
+        disc_target_threshold = 0.60
+        plateau_confusion_floor = 0.55
+    elif _n_ct_early <= 50:
+        if use_swd_alignment:
+            adv_w, align_w, cond_w = 3.0, 1.0, 2.0
+            recon_weight, trust_weight = 0.03, 0.18
+        else:
+            adv_w, align_w, cond_w = 2.5, 1.75, 3.0
+            recon_weight, trust_weight = 0.04, 0.30
+        n_disc_steps = 2
+        disc_target_threshold = 0.62
+        plateau_confusion_floor = 0.50
+    else:
+        adv_w, align_w, cond_w = 2.0, 2.0, 4.0
+        recon_weight, trust_weight = 0.05, 0.50
+        n_disc_steps = 1
+        disc_target_threshold = 0.65
+        plateau_confusion_floor = 0.45
+    align_label = "SWD" if use_swd_alignment else "alignment"
+    print(
+        f"   Losses: adversarial(×{adv_w:g}) + {align_label}(×{align_w:g}) + "
+        f"prototype(×{cond_w:g}) + bio + reconstruction + trust-region"
+    )
     print(f"   Batch size (adaptive): {batch_size} ({n_batches_per_epoch} batches/epoch)")
     print(f"   Disc steps: {n_disc_steps}")
     
@@ -1589,10 +1796,10 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     # 5a. Pre-train discriminator so it provides useful gradients from epoch 1
     # ------------------------------------------------------------------
     if z_ref_all is not None:
-        print("   🔧 Pre-training domain discriminator (10 steps)...")
+        print("   🔧 Pre-training domain discriminator (5 steps)...")
         domain_disc.train()
         adapter.eval()
-        for _pre in range(10):
+        for _pre in range(5):
             optimizer_disc.zero_grad()
             g_pre = torch.Generator()
             g_pre.manual_seed(seed + 500 + _pre)
@@ -1600,7 +1807,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
             pre_idx_r = torch.randint(0, z_ref_all.shape[0], (batch_size,), generator=g_pre)
             with torch.no_grad():
                 z_q_pre = model.encoder(X_query_tensor[pre_idx_q])
-                z_q_pre = adapter(z_q_pre)
+                z_q_pre = z_q_pre + 0.25 * (adapter(z_q_pre) - z_q_pre)
                 z_r_pre = z_ref_all[pre_idx_r]
             pred_r = domain_disc(z_r_pre)
             pred_q = domain_disc(z_q_pre)
@@ -1620,6 +1827,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     while epoch < _max_epochs:
         adapter.train()
         domain_disc.train()
+        warmup_factor = 1.0 if warmup_epochs <= 0 else min((epoch + 1) / warmup_epochs, 1.0)
         
         # Deterministic shuffling per epoch
         g = torch.Generator()
@@ -1638,8 +1846,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
             batch_idx = indices[i:i + batch_size]
             X_batch = X_query_tensor[batch_idx]
             
-            # ---- Train Domain Discriminator (2 steps; keeps disc ahead of
-            # adapter for stronger adversarial gradients)
+            # ---- Train Domain Discriminator
             if z_ref_all is not None:
               for _ds in range(n_disc_steps):
                 optimizer_disc.zero_grad()
@@ -1647,6 +1854,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
                 with torch.no_grad():
                     z_query = model.encoder(X_batch)
                     z_query_adapted = adapter(z_query)
+                    z_query_adapted = z_query + warmup_factor * (z_query_adapted - z_query)
                     g_ref = torch.Generator()
                     g_ref.manual_seed(seed + 300 + epoch * 1000 + i + _ds * 7)
                     ref_idx = torch.randint(
@@ -1688,6 +1896,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
             with torch.no_grad():
                 z_query = model.encoder(X_batch)
             z_query_adapted = adapter(z_query)
+            z_query_adapted = z_query + warmup_factor * (z_query_adapted - z_query)
             
             # Loss 1: Adversarial — fool discriminator (fixed weight)
             if z_ref_all is not None:
@@ -1717,58 +1926,25 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
                     z_q_align = z_query_adapted.repeat(repeats, 1)[:align_n]
                 else:
                     z_q_align = z_query_adapted[:align_n]
-                loss_align, align_comps = alignment_loss(z_ref_batch2, z_q_align)
-                epoch_align_loss += align_comps['total']
+                if use_swd_alignment:
+                    loss_align = swd_loss(z_ref_batch2, z_q_align)
+                    epoch_align_loss += loss_align.item()
+                else:
+                    loss_align, align_comps = alignment_loss(z_ref_batch2, z_q_align)
+                    epoch_align_loss += align_comps['total']
 
-                # Conditional alignment: per-class MMD
-                # Pushes query cells into their matching ref clusters.
-                # Only used for ≤100 classes (standard mode).  In large-scale
-                # mode query_ct_raw is None so this block is skipped entirely
-                # (per-class batches are empty at scale and bio labels are
-                # unreliable).
+                # Conditional alignment: use stable reference prototypes for
+                # small shared label sets rather than noisy per-batch MMD.
                 loss_cond = torch.tensor(0.0, device=device)
-                n_ct_total = len(ref_ct_indices)
-                min_ref_per_ct = 32
-                max_ct_per_batch = 20
-                min_query_per_ct = 4
-
-                if (query_ct_raw is not None
-                        and 0 < n_ct_total
-                        and len(ref_ct_indices) > 0):
+                batch_ct = None
+                if query_ct_raw is not None:
                     batch_ct = query_ct_raw[batch_idx.cpu().numpy()]
-                    # Only consider types present in this batch with enough cells
-                    eligible = []
-                    for ct in np.unique(batch_ct):
-                        if ct not in ref_ct_indices:
-                            continue
-                        if len(ref_ct_indices[ct]) < min_ref_per_ct:
-                            continue  # ref cluster too small → noisy MMD
-                        if (batch_ct == ct).sum() < min_query_per_ct:
-                            continue  # need minimum query samples
-                        eligible.append(ct)
-
-                    # Subsample if too many eligible types
-                    if len(eligible) > max_ct_per_batch:
-                        rng = np.random.RandomState(seed + epoch * 1000 + i)
-                        eligible = list(rng.choice(eligible, max_ct_per_batch, replace=False))
-
-                    cond_count = 0
-                    for ct in eligible:
-                        q_mask = batch_ct == ct
-                        z_q_ct = z_query_adapted[torch.from_numpy(q_mask).to(device)]
-                        ref_idx_ct = ref_ct_indices[ct]
-                        n_sample = min(len(ref_idx_ct), max(len(z_q_ct) * 4, 64))
-                        sampled = np.random.choice(ref_idx_ct, size=n_sample,
-                                                   replace=len(ref_idx_ct) < n_sample)
-                        z_r_ct = z_ref_all[sampled]
-                        ct_loss, _ = alignment_loss(z_r_ct, z_q_ct)
-                        loss_cond = loss_cond + ct_loss
-                        cond_count += 1
-                    if cond_count > 0:
-                        loss_cond = loss_cond / cond_count
+                if prototype_loss is not None and batch_ct is not None:
+                    loss_cond, _ = prototype_loss(z_query_adapted, batch_ct, reference_prototypes)
             else:
                 loss_align = torch.tensor(0.0, device=device)
                 loss_cond = torch.tensor(0.0, device=device)
+                batch_ct = None
 
             # Loss 3: Biological preservation
             if bio_labels_tensor is not None:
@@ -1783,6 +1959,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
                 recon_orig = model.decoder(z_query)
             recon_adapted = model.decoder(z_query_adapted)
             loss_recon = nn.MSELoss()(recon_adapted, recon_orig)
+            loss_trust = (z_query_adapted - z_query).pow(2).mean()
             
             # Loss 5: Adapter L2 regularisation (keeps adapter small)
             # Exclude the learnable scale + global_shift parameters — L2 on
@@ -1793,14 +1970,14 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
                              if name not in ('scale', 'global_shift'))
             
             # Neural adapter combined loss  (≤100 class cross-technology regime):
-            #   adversarial(×5) + MMD/CORAL/Moment alignment(×5)
-            #   + per-cell-type conditional MMD(×10) + bio + recon(×0.05)
-            adv_w, align_w, cond_w, recon_weight = 5.0, 5.0, 10.0, 0.05
+            # hard/meta-class problems benefit from relatively stronger
+            # adversarial pressure and a lighter trust/prototype anchor.
             loss_total = (adv_w        * loss_adversarial
                           + align_w    * loss_align
                           + cond_w     * loss_cond
                           + adaptive_bio_weight * loss_bio
                           + recon_weight * loss_recon
+                          + trust_weight * loss_trust
                           + 1e-4  * adapter_l2)
             
             loss_total.backward()
@@ -1831,7 +2008,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         # Save when discriminator is most confused (domains most aligned).
         # Don't save during the grace period — disc_acc is artificially low
         # before the discriminator has stabilised, which inflates confusion.
-        improved = disc_confusion > best_disc_confusion + 1e-4
+        improved = disc_confusion > best_disc_confusion + 5e-3
         can_save = epoch >= save_grace
         if improved and can_save:
             best_disc_confusion = disc_confusion
@@ -1856,23 +2033,37 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
                 f"DiscAcc: {disc_acc:.3f} | "
                 f"Align: {avg_align_loss:.4f}"
                 f" | Scale: {adapter.effective_scale:.4f}"
+                f" | Warmup: {warmup_factor:.2f}"
                 f"{shift_str} | "
                 f"LR: {lr_now:.6f}"
                 + ("  💾 best" if (improved and can_save) else "")
             )
 
-        # Only allow early stopping after warmup + 10 grace epochs, AND only
-        # when disc_acc has actually dropped near 0.5 (< 0.65). If the disc is
-        # still easily separating ref from query (acc > 0.65), keep training —
-        # stopping early would freeze alignment before it has converged.
+        # Before the requested epoch budget we only stop when the discriminator
+        # has at least moved near confusion. After the main budget, a stable
+        # best-adapter plateau is enough reason to stop; the labeled-query
+        # safeguard below will prevent returning a degraded projection.
         early_stop_eligible = epoch >= (warmup_epochs + 10)
-        disc_near_confused  = disc_acc < 0.65
-        if epochs_without_improvement >= patience and early_stop_eligible and disc_near_confused:
+        disc_near_confused  = disc_acc < disc_target_threshold
+        after_main_budget = epoch >= adaptation_epochs
+        plateau_is_acceptable = best_disc_confusion >= plateau_confusion_floor
+        if (
+            epochs_without_improvement >= patience
+            and early_stop_eligible
+            and (disc_near_confused or (after_main_budget and plateau_is_acceptable))
+        ):
             print(f"   ⏹  Early stopping at epoch {epoch} "
-                  f"(disc accuracy stable at {disc_acc:.3f} for {patience} epochs)")
+                  f"(best adapter stable for {patience} epochs, disc acc {disc_acc:.3f})")
             break
-        elif epochs_without_improvement >= patience and early_stop_eligible and not disc_near_confused:
-            # Patience exceeded but disc still strong — reset counter and keep training
+        elif (
+            epochs_without_improvement >= patience
+            and early_stop_eligible
+            and not disc_near_confused
+            and (not after_main_budget or not plateau_is_acceptable)
+        ):
+            # Patience exceeded but the discriminator is still too strong.
+            # Keep pushing until the epoch cap rather than accepting a
+            # projection whose best state is still far from confusion.
             epochs_without_improvement = 0
     else:
         # while-loop exhausted without early-stop break
@@ -1899,33 +2090,122 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
     
     with torch.no_grad():
         adapted_embeddings = []
+        raw_embeddings = [] if (not _large_scale and z_ref_all is not None) else None
         reconstructed_list = [] if return_reconstructed else None
+        raw_reconstructed_list = [] if (return_reconstructed and raw_embeddings is not None) else None
         
         for i in range(0, len(X_query_tensor), batch_size):
             X_batch = X_query_tensor[i:i + batch_size]
             z_batch = model.encoder(X_batch)
             z_adapted = adapter(z_batch)
             adapted_embeddings.append(z_adapted.cpu().numpy())
+            if raw_embeddings is not None:
+                raw_embeddings.append(z_batch.cpu().numpy())
             
             if return_reconstructed:
                 recon = model.decoder(z_adapted)
                 reconstructed_list.append(recon.cpu().numpy())
+                if raw_reconstructed_list is not None:
+                    raw_reconstructed_list.append(model.decoder(z_batch).cpu().numpy())
         
         adapted_embeddings = np.vstack(adapted_embeddings)
+        if raw_embeddings is not None:
+            raw_embeddings = np.vstack(raw_embeddings)
         if return_reconstructed:
             reconstructed = np.vstack(reconstructed_list)
+            if raw_reconstructed_list is not None:
+                raw_reconstructed = np.vstack(raw_reconstructed_list)
+
+    selected_embeddings = adapted_embeddings
+    selection_note = "adapted"
+    selected_reconstructed = reconstructed if return_reconstructed else None
+    if raw_embeddings is not None:
+        ref_embeddings_np = z_ref_all.detach().cpu().numpy()
+        has_query_labels = (
+            bio_label is not None
+            and query_ct_raw is not None
+            and bio_label in adata_reference.obs.columns
+        )
+        if has_query_labels:
+            ref_labels_eval = np.asarray(adata_reference.obs[bio_label]).astype(str)
+            query_labels_eval = np.asarray(query_ct_raw).astype(str)
+            raw_lta = _label_transfer_accuracy(
+                ref_emb=ref_embeddings_np,
+                query_emb=raw_embeddings,
+                ref_labels=ref_labels_eval,
+                query_labels=query_labels_eval,
+                k=15,
+            )
+            adapted_lta = _label_transfer_accuracy(
+                ref_emb=ref_embeddings_np,
+                query_emb=adapted_embeddings,
+                ref_labels=ref_labels_eval,
+                query_labels=query_labels_eval,
+                k=15,
+            )
+            print("\n📊 Projection safeguard (same labels used for supervision):")
+            print(f"   Direct encoder LTA : {raw_lta:.4f}")
+            print(f"   Adapted query LTA  : {adapted_lta:.4f}")
+        else:
+            raw_lta = None
+            adapted_lta = None
+            print("\n📊 Projection safeguard (unsupervised query):")
+            print("   No shared query labels provided — applying role-mixing safeguard only.")
+
+        domain_col, ref_domain_eval, query_domain_eval, use_ref_ceiling = _get_domain_mixing_labels(
+            adata_reference,
+            adata_query,
+        )
+        if domain_col is not None:
+            ref_ceiling = _neighbor_mixing_score(ref_embeddings_np, ref_domain_eval, k=15) if use_ref_ceiling else None
+            raw_mix = _neighbor_mixing_score(
+                np.vstack([ref_embeddings_np, raw_embeddings]),
+                np.concatenate([ref_domain_eval, query_domain_eval]),
+                k=15,
+            )
+            adapted_mix = _neighbor_mixing_score(
+                np.vstack([ref_embeddings_np, adapted_embeddings]),
+                np.concatenate([ref_domain_eval, query_domain_eval]),
+                k=15,
+            )
+            if ref_ceiling is not None:
+                mix_floor = ref_ceiling * 0.90
+            else:
+                mix_floor = max(raw_mix * 0.85, raw_mix - 0.03)
+            print(f"   Direct encoder mix : {raw_mix:.4f}")
+            print(f"   Adapted query mix  : {adapted_mix:.4f}")
+            if ref_ceiling is not None:
+                print(f"   Mixing floor       : {mix_floor:.4f}  (90% of {domain_col} ceiling {ref_ceiling:.4f})")
+            else:
+                print(f"   Mixing floor       : {mix_floor:.4f}  (preserve most of direct {domain_col} mixing)")
+            strong_bio_gain = (adapted_lta is None) or (adapted_lta >= raw_lta - 1e-4)
+            acceptable_mix = adapted_mix >= mix_floor
+        else:
+            strong_bio_gain = (adapted_lta is None) or (adapted_lta >= raw_lta - 1e-4)
+            acceptable_mix = True
+
+        keep_adapted = strong_bio_gain and acceptable_mix
+        if not keep_adapted:
+            selected_embeddings = raw_embeddings
+            selection_note = "direct encoder fallback"
+            if return_reconstructed and raw_reconstructed_list is not None:
+                selected_reconstructed = raw_reconstructed
+            print("   ⚠️  Adapter candidate failed the labeled-query safeguard.")
+            print("   ↩️  Returning the direct encoder projection for this query.")
+        else:
+            print("   ✅ Adapter improved or matched the direct encoder on the labeled query set.")
     
     # Build output AnnData
     adata_corrected = adata_query.copy()
-    adata_corrected.obsm['X_ScAdver'] = adapted_embeddings
-    print(f"   ✅ Adapted embedding: {adapted_embeddings.shape}")
+    adata_corrected.obsm['X_ScAdver'] = selected_embeddings
+    print(f"   ✅ Output embedding: {selected_embeddings.shape}  ({selection_note})")
     
     if return_reconstructed:
-        adata_corrected.layers['ScAdver_reconstructed'] = reconstructed
-        print(f"   ✅ Reconstructed expression: {reconstructed.shape}")
+        adata_corrected.layers['ScAdver_reconstructed'] = selected_reconstructed
+        print(f"   ✅ Reconstructed expression: {selected_reconstructed.shape}")
     
     print("\n🎉 ADAPTIVE PROJECTION COMPLETE!")
-    print(f"   Output: adata.obsm['X_ScAdver'] (adapted embeddings)")
+    print("   Output: adata.obsm['X_ScAdver'] (query projection embeddings)")
     if return_reconstructed:
         print(f"   Output: adata.layers['ScAdver_reconstructed'] (batch-corrected expression)")
     
