@@ -145,8 +145,7 @@ class AdversarialBatchCorrector(nn.Module):
 class EnhancedResidualAdapter(nn.Module):
     """
     Multi-layer residual adapter with layer normalisation, a learnable
-    scaling parameter, and an optional **global shift** for large-scale
-    domain adaptation.
+    scaling parameter.
 
     Architecture (standard mode)
     ----------------------------
@@ -157,20 +156,6 @@ class EnhancedResidualAdapter(nn.Module):
         │  Linear ─────────────────────────→ * scale
         │                                   │
         └───────────────────────────────────+ → z'
-
-    Architecture (large-scale / mean-shift mode)
-    --------------------------------------------
-    z  ─┬─ Linear → LN → GELU → Dropout ─┐  (layer 1)
-        │  Linear → LN → GELU → Dropout ───┤  (layer 2)
-        │  Linear ─────────────────────────→ * scale
-        │                                   │
-        └─────────────────── + global_shift + → z'
-
-    ``global_shift`` is a trainable 256-d vector initialised to
-    ``mean(z_ref) - mean(z_query)``.  From epoch 1 the bulk of the
-    domain translation is already applied; the network only needs to
-    learn per-cell refinements.  This dramatically accelerates
-    convergence when the domain shift is primarily translational.
 
     Parameters
     ----------
@@ -186,16 +171,12 @@ class EnhancedResidualAdapter(nn.Module):
         Initial value for the learnable scaling parameter (default 0.01).
         In practice set to ``max(0.8 * residual_magnitude, 0.1)`` by
         ``transform_query_adaptive``.
-    mean_shift : Tensor (latent_dim,) or None
-        If given, a trainable global translation vector initialised to
-        this value.  Use ``mean(z_ref) - mean(z_query)`` so the adapter
-        starts with the inter-domain mean offset already applied.
     seed : int or None
         If given, applies deterministic Xavier init.
     """
     
     def __init__(self, latent_dim, adapter_dim=128, n_layers=3, dropout=0.1,
-                 init_scale=0.01, mean_shift=None, seed=None,
+                 init_scale=0.01, seed=None,
                  min_scale=None, max_scale=None):
         super().__init__()
         
@@ -218,31 +199,15 @@ class EnhancedResidualAdapter(nn.Module):
         self.scale = nn.Parameter(torch.tensor(init_scale))
         self.min_scale = min_scale
         self.max_scale = max_scale
-
-        # Optional global shift (large-scale mode).
-        # Initialised to the inter-domain mean offset so the adapter
-        # starts with the bulk of the translation already applied.
-        if mean_shift is not None:
-            self.global_shift = nn.Parameter(mean_shift.clone().float())
-        else:
-            self.global_shift = None
         
-        # Deterministic init (applied to all params; global_shift is set
-        # AFTER this so it keeps its initialised value)
+        # Deterministic init
         if seed is not None:
             initialize_weights_deterministically(self, seed=seed, gain=0.01)
-        # Re-apply global_shift after deterministic init overwrites it
-        if mean_shift is not None:
-            with torch.no_grad():
-                self.global_shift.copy_(mean_shift.clone().float())
     
     def forward(self, z):
-        """z' = z + global_shift (if set) + scale * adapter(z)"""
+        """z' = z + scale * adapter(z)"""
         residual = self.adapter(z)
-        out = z + self.scale * residual
-        if self.global_shift is not None:
-            out = out + self.global_shift.unsqueeze(0)
-        return out
+        return z + self.scale * residual
     
     @property
     def effective_scale(self):

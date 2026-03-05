@@ -427,7 +427,7 @@ def _run_large_scale_refinement(
             adapter_l2 = sum(
                 p.pow(2).sum()
                 for name, p in adapter.named_parameters()
-                if name not in ('scale', 'global_shift')
+                if name != 'scale'
             )
 
             proto_weight = 6.0 if used_classes > 0 else 0.0
@@ -1962,12 +1962,12 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
             loss_trust = (z_query_adapted - z_query).pow(2).mean()
             
             # Loss 5: Adapter L2 regularisation (keeps adapter small)
-            # Exclude the learnable scale + global_shift parameters — L2 on
-            # these always pushes them toward 0, fighting the alignment
-            # objectives.  Regularise only the network weights.
+            # Exclude the learnable scale parameter — L2 on this always
+            # pushes it toward 0, fighting alignment objectives.
+            # Regularise only the network weights.
             adapter_l2 = sum(p.pow(2).sum()
                              for name, p in adapter.named_parameters()
-                             if name not in ('scale', 'global_shift'))
+                             if name != 'scale')
             
             # Neural adapter combined loss  (≤100 class cross-technology regime):
             # hard/meta-class problems benefit from relatively stronger
@@ -2023,9 +2023,6 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
         if epoch % 10 == 0 or epoch == 1:
             lr_now = scheduler_adapter.get_last_lr()[0]
             budget_str = f"/{adaptation_epochs}" if epoch <= adaptation_epochs else f"/{_max_epochs}(ext)"
-            shift_str = (f" | Shift: {adapter.global_shift.norm().item():.4f}"
-                         if hasattr(adapter, 'global_shift') and adapter.global_shift is not None
-                         else "")
             print(
                 f"   Epoch {epoch:>3d}{budget_str} | "
                 f"Adapter: {avg_adapter_loss:.4f} | "
@@ -2034,7 +2031,7 @@ def transform_query_adaptive(model, adata_query, adata_reference, bio_label=None
                 f"Align: {avg_align_loss:.4f}"
                 f" | Scale: {adapter.effective_scale:.4f}"
                 f" | Warmup: {warmup_factor:.2f}"
-                f"{shift_str} | "
+                f" | "
                 f"LR: {lr_now:.6f}"
                 + ("  💾 best" if (improved and can_save) else "")
             )
