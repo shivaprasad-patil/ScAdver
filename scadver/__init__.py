@@ -15,7 +15,6 @@ from .core import (
 )
 from .model import (
     AdversarialBatchCorrector,
-    ResidualAdapter,
     EnhancedResidualAdapter,
     NeighborhoodResidualAdapter,
     DomainDiscriminator,
@@ -42,7 +41,6 @@ __all__ = [
     "load_model",
     "set_global_seed",
     "AdversarialBatchCorrector",
-    "ResidualAdapter",
     "EnhancedResidualAdapter",
     "NeighborhoodResidualAdapter",
     "DomainDiscriminator",
