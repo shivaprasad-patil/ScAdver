@@ -282,14 +282,14 @@ def test_get_domain_mixing_labels_uses_reference_query_roles():
     adata_ref = _make_adata(
         X=np.zeros((4, 2)),
         obs={
-            "Source": ["AZ", "AZ", "AZ", "AZ"],
+            "Source": ["source_ref", "source_ref", "source_ref", "source_ref"],
             "batch": ["b0", "b1", "b0", "b1"],
         },
     )
     adata_query = _make_adata(
         X=np.zeros((4, 2)),
         obs={
-            "Source": ["Phenaros", "Phenaros", "Phenaros", "Phenaros"],
+            "Source": ["source_query", "source_query", "source_query", "source_query"],
             "batch": ["b0", "b1", "b0", "b1"],
         },
     )
