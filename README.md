@@ -1,4 +1,4 @@
-# 🧬 ScAdver — Adversarial Batch Correction for Single-Cell Data
+#  ScAdver — Adversarial Batch Correction for Single-Cell Data
 
 ScAdver eliminates technical batch effects from single-cell RNA-seq data while preserving biological variation and cell type identity. It follows a **train-once, project-forever** paradigm — train on reference data, then rapidly project unlimited query batches without retraining.
 
@@ -6,14 +6,14 @@ ScAdver eliminates technical batch effects from single-cell RNA-seq data while p
 
 ## Key Features
 
-- ✅ **Train once, project forever** — reuse the trained encoder across any number of query batches
-- 🔒 **Fully reproducible** — `set_global_seed()` seeds every random operation
-- 🎯 **Biology preserved** — adversarial discriminator removes batch effects without touching biological signal
-- 🏗️ **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, unbounded output with learnable scale (≤100 classes)
-- 📐 **Distribution alignment** — MMD + Moment-Matching + CORAL losses for robust domain adaptation
-- 🔀 **Probe-gated query projection** — `transform_query_adaptive` uses a raw-shift probe (`||Δ(z)||`) plus overlap/class-count gate to route direct vs neighborhood vs neural vs analytical paths
-- 🚀 **Fast large-scale mode** — analytical path corrects 100k+ cells in seconds; optional residual refinement exists for local experimentation but is not the validated default
-- 🖥️ **Multi-device** — CPU, CUDA, and Apple Silicon (MPS)
+-  **Train once, project forever** — reuse the trained encoder across any number of query batches
+-  **Fully reproducible** — `set_global_seed()` seeds every random operation
+-  **Biology preserved** — adversarial discriminator removes batch effects without touching biological signal
+-  **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, unbounded output with learnable scale (≤100 classes)
+-  **Distribution alignment** — MMD + Moment-Matching + CORAL losses for robust domain adaptation
+-  **Probe-gated query projection** — `transform_query_adaptive` uses a raw-shift probe (`||Δ(z)||`) plus overlap/class-count gate to route direct vs neighborhood vs neural vs analytical paths
+-  **Fast large-scale mode** — analytical path corrects 100k+ cells in seconds; optional residual refinement exists for local experimentation but is not the validated default
+-  **Multi-device** — CPU, CUDA, and Apple Silicon (MPS)
 
 ## Installation
 
@@ -27,7 +27,7 @@ pip install git+https://github.com/shivaprasad-patil/ScAdver.git
 
 Pass all data in a single call. The model trains on everything and returns corrected embeddings and reconstructed expression.
 
-**✅ Use when** all data is available upfront and no new query batches are expected.
+** Use when** all data is available upfront and no new query batches are expected.
 
 ```python
 from scadver import adversarial_batch_correction
@@ -45,7 +45,7 @@ adata_corrected, model, metrics = adversarial_batch_correction(
 
 Split data into reference and query yourself, train on reference only, then project query batches automatically. `transform_query_adaptive` probes for domain shift and routes query projection only when needed.
 
-**✅ Use when** query batches arrive over time, come from a different protocol, or you want to deploy a reusable model.
+** Use when** query batches arrive over time, come from a different protocol, or you want to deploy a reusable model.
 
 → Pancreas walkthrough: **[examples/ScAdver_pancreas_batch_correction.ipynb](examples/ScAdver_pancreas_batch_correction.ipynb)**  
 → PBMC v2/v3 walkthrough: **[examples/ScAdver_pbmc_batch_correction.ipynb](examples/ScAdver_pbmc_batch_correction.ipynb)**

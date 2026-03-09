@@ -1,4 +1,4 @@
-# 🔬 ScAdver: Encoder Training and Query Projection Explained
+#  ScAdver: Encoder Training and Query Projection Explained
 
 ## Overview
 
@@ -21,7 +21,7 @@ Current auto-routing for query projection (`transform_query_adaptive`):
 
 ---
 
-## 📊 PHASE 1: Training the Encoder on Reference Data
+##  PHASE 1: Training the Encoder on Reference Data
 
 ### The Architecture
 
@@ -98,9 +98,9 @@ X' = decoder(Z)
 loss = MSE(X_ref, X')
 
 What encoder learns:
-  ✅ "I must keep important information in Z"
-  ✅ "I cannot discard too much"
-  ✅ "Z needs to capture gene expression patterns"
+   "I must keep important information in Z"
+   "I cannot discard too much"
+   "Z needs to capture gene expression patterns"
 ```
 
 #### 2. **Biology Preservation Loss** (Forces Biological Signal Retention)
@@ -113,9 +113,9 @@ loss = CrossEntropy(cell_type_pred, true_cell_types)
 weight = 20.0 (HIGH - we want this to succeed!)
 
 What encoder learns:
-  ✅ "Gene patterns that distinguish cell types are IMPORTANT"
-  ✅ "Keep marker genes information in Z"
-  ✅ "Preserve cell state, differentiation signals"
+   "Gene patterns that distinguish cell types are IMPORTANT"
+   "Keep marker genes information in Z"
+   "Preserve cell state, differentiation signals"
   
 Example: If T-cells express CD3, encoder learns:
   "High CD3 → Important for biology → Keep in Z"
@@ -131,9 +131,9 @@ loss = -CrossEntropy(batch_pred, true_batches)  # NOTE: NEGATIVE!
 weight = 0.5
 
 What encoder learns:
-  ❌ "Gene patterns that distinguish batches are NOISE"
-  ❌ "Remove protocol-specific signals from Z"
-  ❌ "Hide batch information"
+   "Gene patterns that distinguish batches are NOISE"
+   "Remove protocol-specific signals from Z"
+   "Hide batch information"
   
 Example: If batch1 has higher library size than batch2:
   "Library size differences → Batch noise → Remove from Z"
@@ -195,7 +195,7 @@ The weights form a **learned filter**:
 
 ---
 
-## 🧊 PHASE 2: Freezing the Encoder
+##  PHASE 2: Freezing the Encoder
 
 ### What "Frozen" Means
 
@@ -221,7 +221,7 @@ encoder.requires_grad = False # Weights cannot change (FROZEN)
 
 ---
 
-## 🚀 PHASE 3: Projecting Query Data Through Frozen Encoder
+##  PHASE 3: Projecting Query Data Through Frozen Encoder
 
 ### The Process
 
@@ -279,10 +279,10 @@ Z_query = W4 @ h3 + b4
 Z_query = LayerNorm(Z_query)
 
 # Z_query now contains:
-#   ✅ T-cell identity (preserved)
-#   ✅ Cell state, differentiation (preserved)
-#   ❌ smartseq2 batch effects (removed!)
-#   ❌ Library size differences (removed!)
+#    T-cell identity (preserved)
+#    Cell state, differentiation (preserved)
+#    smartseq2 batch effects (removed!)
+#    Library size differences (removed!)
 ```
 
 ### Why Batch Correction Happens Automatically
@@ -346,7 +346,7 @@ encoder(X_query_batch_new) ≈ g(f_bio) ← batch_new effect removed!
 
 ---
 
-## 🎯 Why Biology Is Preserved
+##  Why Biology Is Preserved
 
 ### During Training
 ```python
@@ -382,7 +382,7 @@ The biological variation is PRESERVED because:
 
 ---
 
-## 🔍 Visual Analogy: Sunglasses Filter
+##  Visual Analogy: Sunglasses Filter
 
 Think of the encoder as **polarized sunglasses**:
 
@@ -390,15 +390,15 @@ Think of the encoder as **polarized sunglasses**:
 ```
 Reference data (bright light with glare):
   ┌─────────────────────────────┐
-  │ ☀️ Biology (useful signal)  │
-  │ ✨ Batch (glare/noise)      │
+  │  Biology (useful signal)  │
+  │  Batch (glare/noise)      │
   └─────────────────────────────┘
         ↓
   [Learn polarization filter]
         ↓
   ┌─────────────────────────────┐
-  │ ☀️ Biology (clear)          │
-  │ ❌ Batch (filtered out)     │
+  │  Biology (clear)          │
+  │  Batch (filtered out)     │
   └─────────────────────────────┘
 
 The "polarization angle" is learned by:
@@ -410,15 +410,15 @@ The "polarization angle" is learned by:
 ```
 Query data (bright light with DIFFERENT glare):
   ┌─────────────────────────────┐
-  │ ☀️ Biology (useful signal)  │
-  │ ✨ NEW Batch (new glare)    │
+  │  Biology (useful signal)  │
+  │  NEW Batch (new glare)    │
   └─────────────────────────────┘
         ↓
   [Apply SAME filter - frozen]
         ↓
   ┌─────────────────────────────┐
-  │ ☀️ Biology (clear)          │
-  │ ❌ NEW Batch (filtered out) │
+  │  Biology (clear)          │
+  │  NEW Batch (filtered out) │
   └─────────────────────────────┘
 
 The SAME polarization angle works because:
@@ -429,7 +429,7 @@ The SAME polarization angle works because:
 
 ---
 
-## 📊 Complete Workflow Example
+##  Complete Workflow Example
 
 ### Setup
 ```python
@@ -492,15 +492,15 @@ sc.tl.umap(adata_combined)
 sc.pl.umap(adata_combined, color=['batch', 'celltype'])
 
 # What you see:
-# ✅ Cell types cluster together (biology preserved)
-# ✅ Batches are mixed within each cluster (batch corrected)
-# ✅ smartseq2 integrates seamlessly with batch1/2/3
-# ✅ No training was needed for query!
+#  Cell types cluster together (biology preserved)
+#  Batches are mixed within each cluster (batch corrected)
+#  smartseq2 integrates seamlessly with batch1/2/3
+#  No training was needed for query!
 ```
 
 ---
 
-## 🧪 Technical Details
+##  Technical Details
 
 ### Network Capacity
 ```python
@@ -551,7 +551,7 @@ Total parameters breakdown:
 
 ---
 
-## ✅ Summary
+##  Summary
 
 ### Training Phase (Reference Data)
 1. Encoder learns transformation: `X → Z`

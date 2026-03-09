@@ -151,7 +151,7 @@ for ALL query cells. Source mixing may be reduced.
 | Property | Value |
 |----------|-------|
 | Training epochs | 0 |
-| Per-class correction | ✅ (matched classes) |
+| Per-class correction |  (matched classes) |
 | Orphan fallback | Global mean shift |
 
 ### Optional refinement
@@ -200,7 +200,7 @@ adata_query_corrected.obsm['X_ScAdver']   # batch-corrected latent embeddings
 |-|--------|--------------|--------|------------|
 | Class regime | Any | Strong-overlap, `<=40` matched classes | `<=100` (when not routed to neighborhood) | `>100` |
 | Needs bio labels | No | Yes | Optional (recommended) | Yes |
-| Handles non-linear shift | Limited | Limited | ✅ | Limited |
+| Handles non-linear shift | Limited | Limited |  | Limited |
 | Handles many orphan classes | Limited | Limited | Moderate | Global fallback |
 | Zero overlap behavior | N/A | Falls back to direct | Uses unsupervised losses / safeguard | Global mean shift with warning |
 
