@@ -29,7 +29,7 @@ from .losses import (
     SlicedWassersteinLoss,
 )
 
-__version__ = "1.7.8"
+__version__ = "1.7.9"
 __author__ = "Shivaprasad Patil"
 __email__ = "shivaprasad309319@gmail.com"
 

@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="scadver",
-    version="1.7.8",
+    version="1.7.9",
     author="Shivaprasad Patil",
     author_email="shivaprasad309319@gmail.com",
     description="Adversarial Batch Correction for Single-Cell Data",

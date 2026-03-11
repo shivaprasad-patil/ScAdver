@@ -1649,19 +1649,12 @@ def transform_query_adaptive(
     # Path A  ANALYTICAL  (n_classes > 100):
     #   Per-class mean-shift: z' = z_query + (mean(z_ref_c) - mean(z_query_c))
     #   Works when: domain shift ≈ per-class translation (same platform, many
-    #               perturbation classes); neural training fails at this scale.
-    #   Validated:  Large-scale perturbation dataset (2581 classes):
-    #               source_mixing 0.120→0.183, LTA(matched)=0.761
-    #               Held-out batch validation (1312 classes):
-    #               source_mixing 0.315, LTA(matched)=0.761
-    #   Neural (all variants): source_mixing 0.037–0.112 — always WORSE.
+    #               perturbation classes); neural training doesn't increase performance.
     #
     # Path B  NEURAL ADAPTER  (n_classes ≤ 100):
     #   Adversarial + alignment + conditional MMD losses; learns non-linear
     #   transformation. Works when: cross-technology shift, few cell types,
     #   reliable bio-classifier labels.
-    #   Validated:  Pancreas (14 classes): LTA 0.972, tech_mixing at ceiling.
-    #   Analytical  on pancreas: LTA=0.931 — WORSE than raw encoder (0.957).
     #
     # Conclusion: two paths are empirically necessary. The >100 class
     # threshold is a reliable proxy for the biological regime:
@@ -1887,7 +1880,7 @@ def transform_query_adaptive(
 
     n_batches_per_epoch = max(1, (n_total + batch_size - 1) // batch_size)
     # Coarse meta-class problems need more adversarial pressure and a looser
-    # trust region than well-behaved atlas transfers such as pancreas.
+    # trust region than well-behaved atlas transfers.
     if _n_ct_early <= 20:
         if use_swd_alignment:
             adv_w, align_w, cond_w = 3.0, 0.9, 1.5
