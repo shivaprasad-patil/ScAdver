@@ -6,9 +6,9 @@
 
 | Condition | Path | What runs |
 |-----------|------|-----------|
-| `||Δ(z)|| <= 0.1` | Direct projection | Frozen encoder only (`z = E(x_query)`) |
-| `||Δ(z)|| > 0.1`, strong overlap (`shared_ratio >= 0.8`) and `n_classes <= 40` | Neighborhood residual | Same-class balanced-neighbor residual update |
-| `||Δ(z)|| > 0.1`, `n_classes <= 100` (otherwise) | Neural adapter | `EnhancedResidualAdapter` with adversarial + alignment losses |
+| `norm(Δ(z)) <= 0.1` | Direct projection | Frozen encoder only (`z = E(x_query)`) |
+| `norm(Δ(z)) > 0.1`, strong overlap (`shared_ratio >= 0.8`) and `n_classes <= 40` | Neighborhood residual | Same-class balanced-neighbor residual update |
+| `norm(Δ(z)) > 0.1`, `n_classes <= 100` (otherwise) | Neural adapter | `EnhancedResidualAdapter` with adversarial + alignment losses |
 | `>100` reference classes | Analytical mean-shift | Per-class centroid correction; optional trust-region refinement remains experimental |
 
 Routing is automatic in `alignment_mode='auto'`.
