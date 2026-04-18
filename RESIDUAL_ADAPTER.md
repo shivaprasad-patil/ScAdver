@@ -1,4 +1,4 @@
-# Query Projection with ScAdver — Residual Adapter & Analytical Path
+# Query Projection with ScAdver — Neighborhood and Neural Residual Paths
 
 ## Overview
 
@@ -7,11 +7,18 @@
 | Condition | Path | What runs |
 |-----------|------|-----------|
 | `norm(Δ(z)) <= 0.1` | Direct projection | Frozen encoder only (`z = E(x_query)`) |
-| `norm(Δ(z)) > 0.1`, strong overlap (`shared_ratio >= 0.8`) and `n_classes <= 40` | Neighborhood residual | Same-class balanced-neighbor residual update |
-| `norm(Δ(z)) > 0.1`, `n_classes <= 100` (otherwise) | Neural adapter | `EnhancedResidualAdapter` with adversarial + alignment losses |
-| `>100` reference classes | Analytical mean-shift | Per-class centroid correction; optional trust-region refinement remains experimental |
+| `norm(Δ(z)) > 0.1`, strong shared coverage (`shared_cell_ratio >= 0.8`, `shared_class_ratio >= 0.8`) and enough cells in every shared class (`min_shared_ref_cells >= 4`, `min_shared_query_cells >= 4`) | Neighborhood residual | Same-class balanced-neighbor residual update |
+| `norm(Δ(z)) > 0.1` (otherwise) | Neural adapter | `EnhancedResidualAdapter` with adversarial + alignment losses |
 
 Routing is automatic in `alignment_mode='auto'`.
+
+| Feature | Neighborhood residual | `EnhancedResidualAdapter` |
+|---------|-----------------------|---------------------------|
+| Mechanism | Deterministic same-class neighbor pull | Trainable neural residual function |
+| Update rule | `z' = z + alpha * (target - z)` | `z' = z + scale * R(z)` |
+| When it works best | Strong shared bio-label coverage with enough cells in every shared class | Harder shifts where local neighbor targets are not sufficient |
+| Training required | No | Yes |
+| Main benefit | Simple, stable, interpretable correction | Flexible non-linear adaptation |
 
 ---
 
@@ -19,7 +26,7 @@ Routing is automatic in `alignment_mode='auto'`.
 
 ### When it activates
 
-This path activates only when query/reference class overlap is high and the matched class space is moderate (`<=40`).
+This path activates only when query/reference overlap is high and every shared class has enough matched cells in both reference and query.
 
 ### Update rule
 
@@ -37,7 +44,7 @@ This path is deterministic in current routing: once selected by probe+gate, it a
 
 ---
 
-## Path B — Neural Adapter (≤ 100 classes, when not routed to neighborhood)
+## Path B — Neural Adapter (fallback when not routed to neighborhood)
 
 ### When it activates
 
@@ -75,7 +82,7 @@ loss_adapter = (
 |---------|-------|
 | ≤ 20 | 2.0 |
 | ≤ 100 | 1.0 |
-| > 100 | N/A (analytical path) |
+| > 100 | 0.0 (disabled for very large query label spaces) |
 | overlap < 30% | 0.0 (disabled — noisy gradients) |
 
 ### Training Details
@@ -104,62 +111,6 @@ Pancreas dataset (14 cell types, 9 technologies):
 
 ---
 
-## Path C — Analytical Mean-Shift (> 100 classes)
-
-### When it activates
-
-Large perturbation screens where the reference and query share a **common biological label** (e.g. perturbation name) across many classes (hundreds to thousands). Neural training fails at this scale — per-class statistics give a more accurate and far faster correction.
-
-### Algorithm
-
-**Step 1 — Encode query with frozen encoder (no gradient)**
-```python
-z_query = encoder(x_query)   # inference only
-z_ref   = ref_embeddings      # already computed at Stage-1
-```
-
-**Step 2 — Compute global fallback shift**
-```python
-global_shift = z_ref.mean(axis=0) - z_query.mean(axis=0)
-```
-
-**Step 3 — Per-class centroid correction**
-
-For each class `c` present in the query:
-
-```python
-if c in ref_classes and n_query_cells(c) >= 3:
-    shift_c = mean(z_ref[c]) - mean(z_query[c])
-    z_corrected[query_mask_c] = z_query[query_mask_c] + shift_c
-else:
-    # Orphan or too few cells → global fallback
-    z_corrected[query_mask_c] = z_query[query_mask_c] + global_shift
-```
-
-**Zero-overlap guard**
-
-If **no query class** has a reference counterpart, a `UserWarning` is raised and **all** query cells receive the global mean shift:
-
-```
-UserWarning: "Zero perturbation class overlap between query and reference —
-no per-class centroid alignment possible. Falling back to global mean shift
-for ALL query cells. Source mixing may be reduced.
-```
-
-### Properties
-
-| Property | Value |
-|----------|-------|
-| Training epochs | 0 |
-| Per-class correction |  (matched classes) |
-| Orphan fallback | Global mean shift |
-
-### Optional refinement
-
-An optional trust-region residual refinement can be layered on top of the analytical output for local experimentation. It is intentionally conservative and is **not** the validated default for large-class datasets at this stage.
-
----
-
 ## Usage
 
 ```python
@@ -168,7 +119,7 @@ from scadver import adversarial_batch_correction, transform_query_adaptive
 # Stage 1 — train encoder on reference
 adata_ref_corrected, model, metrics = adversarial_batch_correction(
     adata=adata_reference,
-    bio_label='celltype',      # or 'perturbation' for screens
+    bio_label='celltype',
     batch_label='tech',
     epochs=500,
 )
@@ -178,7 +129,7 @@ adata_query_corrected = transform_query_adaptive(
     model=model,
     adata_query=adata_query,
     adata_reference=adata_reference,
-    bio_label='celltype',      # routing uses probe threshold + overlap/class-count gate
+    bio_label='celltype',      # routing uses probe threshold + overlap/support gate
     adaptation_epochs=300,
     warmup_epochs=20,
     patience=50,
@@ -196,12 +147,12 @@ adata_query_corrected.obsm['X_ScAdver']   # batch-corrected latent embeddings
 
 ## Limitations
 
-| | Direct | Neighborhood | Neural | Analytical |
-|-|--------|--------------|--------|------------|
-| Class regime | Any | Strong-overlap, `<=40` matched classes | `<=100` (when not routed to neighborhood) | `>100` |
-| Needs bio labels | No | Yes | Optional (recommended) | Yes |
-| Handles non-linear shift | Limited | Limited |  | Limited |
-| Handles many orphan classes | Limited | Limited | Moderate | Global fallback |
-| Zero overlap behavior | N/A | Falls back to direct | Uses unsupervised losses / safeguard | Global mean shift with warning |
+| | Direct | Neighborhood | Neural |
+|-|--------|--------------|--------|
+| Class regime | Any | Strong-overlap with enough matched cells per shared class | Fallback path when neighborhood is not selected |
+| Needs bio labels | No | Yes | Optional (recommended) |
+| Handles non-linear shift | Limited | Limited | Yes |
+| Handles many orphan classes | Limited | Limited | Moderate |
+| Zero overlap behavior | N/A | Falls back to direct | Uses unsupervised losses / safeguard |
 
 ---

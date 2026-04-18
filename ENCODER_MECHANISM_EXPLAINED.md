@@ -10,14 +10,14 @@ This document explains the complete mechanism in detail.
 
 Current example notebooks:
 - `examples/ScAdver_pancreas_batch_correction.ipynb`
+- `examples/ScAdver_pancreas_neural_residual_adapter.ipynb`
 - `examples/ScAdver_pbmc_batch_correction.ipynb`
 
 Current auto-routing for query projection (`transform_query_adaptive`):
-1. Compute raw shift `||Δ(z)||` from reference/query latent space.
-2. If `||Δ(z)|| <= 0.1`, return direct projection.
-3. If `||Δ(z)|| > 0.1` and overlap is strong (`shared_ratio >= 0.8`) with `n_classes <= 40`, run neighborhood residual mode.
-4. Otherwise, for `<=100` classes, run neural residual adapter mode.
-5. For `>100` classes, run analytical mean-shift path.
+1. Compute raw shift `norm(Δ(z))` from reference/query latent space.
+2. If `norm(Δ(z)) <= 0.1`, return direct projection.
+3. If `norm(Δ(z)) > 0.1` and shared bio-label coverage is strong (`shared_cell_ratio >= 0.8`, `shared_class_ratio >= 0.8`) with enough cells in every shared class (`min_shared_ref_cells >= 4`, `min_shared_query_cells >= 4`), run neighborhood residual mode.
+4. Otherwise, run neural residual adapter mode.
 
 ---
 
@@ -460,7 +460,7 @@ adata_ref_corrected, model, metrics = adversarial_batch_correction(
 
 ### Projection Phase
 ```python
-# Path auto-selected by class count (≤100 → neural, >100 → analytical)
+# Path auto-selected by raw shift + overlap gate
 adata_query_corrected = transform_query_adaptive(
     model=model,              # Frozen encoder weights
     adata_query=adata_query,
@@ -468,15 +468,15 @@ adata_query_corrected = transform_query_adaptive(
     bio_label='celltype',     # Optional but recommended
 )
 
-# What happened (v1.7.5 two-path routing):
-# 1. ScAdver counts distinct biological classes in the reference
-# 2. If classes ≤ 100 → trains EnhancedResidualAdapter with adversarial +
+# What happened:
+# 1. ScAdver encodes the query with the frozen reference encoder
+# 2. It probes raw latent shift and shared-label coverage
+# 3. Small shift -> direct projection
+# 4. Strong shared-label coverage with enough matched cells per shared class ->
+#    deterministic neighborhood residual
+# 5. Otherwise -> trains EnhancedResidualAdapter with adversarial +
 #    MMD + CORAL + moment-matching losses
-#    Output: z' = z + scale * R(z)  in same latent space as z_ref
-# 3. If classes > 100 → analytical per-class mean-shift is the validated path
-#    Optional trust-region residual refinement can be enabled for local testing
-#    Output: z' = z + (centroid_ref_class - centroid_query_class)
-#            with an optional small refinement term in experimental runs
+#    Output: z' = z + scale * R(z) in the same latent space as z_ref
 ```
 
 ### Result

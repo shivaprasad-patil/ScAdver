@@ -9,10 +9,9 @@ ScAdver eliminates technical batch effects from single-cell RNA-seq data while p
 -  **Train once, project forever** — reuse the trained encoder across any number of query batches
 -  **Fully reproducible** — `set_global_seed()` seeds every random operation
 -  **Biology preserved** — adversarial discriminator removes batch effects without touching biological signal
--  **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, unbounded output with learnable scale (≤100 classes)
+-  **Enhanced residual adapter** — 3-layer, LayerNorm, GELU, unbounded output with learnable scale
 -  **Distribution alignment** — MMD + Moment-Matching + CORAL losses for robust domain adaptation
--  **Probe-gated query projection** — `transform_query_adaptive` uses a raw latent-shift probe plus overlap/class-count gates to route direct vs neighborhood vs neural vs analytical paths
--  **Fast large-scale mode** — analytical path corrects 100k+ cells in seconds; optional residual refinement exists for local experimentation but is not the validated default
+-  **Probe-gated query projection** — `transform_query_adaptive` uses a raw latent-shift probe plus overlap/support gates to route direct vs neighborhood vs neural paths
 -  **Multi-device** — CPU, CUDA, and Apple Silicon (MPS)
 
 ## Installation
@@ -48,6 +47,7 @@ Split data into reference and query yourself, train on reference only, then proj
 **Use when** query batches arrive over time, come from a different protocol, or you want to deploy a reusable model.
 
 → Pancreas walkthrough: **[examples/ScAdver_pancreas_batch_correction.ipynb](examples/ScAdver_pancreas_batch_correction.ipynb)**  
+→ Pancreas neural-adapter walkthrough: **[examples/ScAdver_pancreas_neural_residual_adapter.ipynb](examples/ScAdver_pancreas_neural_residual_adapter.ipynb)**  
 → PBMC v2/v3 walkthrough: **[examples/ScAdver_pbmc_batch_correction.ipynb](examples/ScAdver_pbmc_batch_correction.ipynb)**
 
 ---
@@ -79,15 +79,14 @@ The encoder is trained adversarially:
 
 1. Encode query with the frozen reference encoder and compute a raw latent-shift probe.
 2. If the raw shift is small (`norm(Δ(z)) <= 0.1`), return direct projection.
-3. If the raw shift is larger, overlap is strong (`shared_ratio >= 0.8`), and class count is moderate (`n_classes <= 40`), use neighborhood residual mode.
-4. Otherwise, use the neural adapter path for `<=100` classes.
-5. For `>100` reference classes, route to analytical mean-shift.
+3. If the raw shift is larger, shared bio-label coverage is strong (`shared_cell_ratio >= 0.8`, `shared_class_ratio >= 0.8`), and every shared class has enough cells in both reference and query (`min_shared_ref_cells >= 4`, `min_shared_query_cells >= 4`), use neighborhood residual mode.
+4. Otherwise, use the neural adapter path.
 
-| Classes | Path | Method |
-|---------|------|--------|
-| ≤ 40 (strong overlap) | **Neighborhood residual** | Same-class, assay-balanced neighbor targets with deterministic residual step |
-| ≤ 100 (otherwise) | **Neural adapter** | `EnhancedResidualAdapter` — adversarial + alignment losses, warmup, early stopping, final safeguard |
-| > 100 | **Analytical** | Per-class mean-shift for all classes; optional residual refinement exists but remains experimental |
+| Route | Method |
+|-------|--------|
+| **Direct projection** | Frozen encoder only when raw shift is small |
+| **Neighborhood residual** | Same-class, assay-balanced neighbor targets with deterministic residual step |
+| **Neural adapter** | `EnhancedResidualAdapter` with adversarial + alignment losses, warmup, early stopping, and final safeguard |
 
 Full technical details: [ENCODER_MECHANISM_EXPLAINED.md](ENCODER_MECHANISM_EXPLAINED.md) · [RESIDUAL_ADAPTER.md](RESIDUAL_ADAPTER.md)
 

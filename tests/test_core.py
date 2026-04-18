@@ -116,11 +116,102 @@ def test_reference_only_training_disables_single_class_source_adversary():
     assert 0.0 <= metrics["source_integration"] <= 1.0
 
 
-def test_transform_query_adaptive_uses_analytical_path_for_large_reference_class_counts(capsys):
+def test_detect_domain_shift_routes_neighbor_for_high_shared_coverage():
     rng = np.random.default_rng(0)
+    ref_labels = ["A"] * 6 + ["B"] * 6 + ["C"] * 6
+    query_labels = ["A"] * 4 + ["B"] * 4 + ["C"] * 4
+
+    adata_ref = _make_adata(
+        X=rng.normal(size=(len(ref_labels), 5)),
+        obs={
+            "celltype": ref_labels,
+            "batch": ["ref_a", "ref_b"] * (len(ref_labels) // 2),
+        },
+    )
+    adata_query = _make_adata(
+        X=rng.normal(size=(len(query_labels), 5)),
+        obs={
+            "celltype": query_labels,
+            "batch": ["query_a", "query_b"] * (len(query_labels) // 2),
+        },
+    )
+
+    model = AdversarialBatchCorrector(
+        input_dim=5,
+        latent_dim=3,
+        n_bio_labels=3,
+        n_batches=2,
+        n_sources=None,
+    )
+    model.bio_encoder = LabelEncoder().fit(np.asarray(["A", "B", "C"]))
+
+    result = core.detect_domain_shift(
+        model=model,
+        adata_query=adata_query,
+        adata_reference=adata_ref,
+        bio_label="celltype",
+        device="cpu",
+        seed=0,
+    )
+
+    assert result["shared_cell_ratio"] == 1.0
+    assert result["shared_class_ratio"] == 1.0
+    assert result["shared_class_count"] == 3
+    assert result["min_shared_ref_cells"] == 6
+    assert result["min_shared_query_cells"] == 4
+    assert result["recommended_mode"] == "neighbor"
+
+
+def test_detect_domain_shift_avoids_neighbor_when_shared_class_support_is_too_low():
+    rng = np.random.default_rng(2)
+    ref_labels = ["A"] * 6 + ["B"] * 6 + ["C"] * 6
+    query_labels = ["A"] * 4 + ["B"] * 4 + ["C"] * 1
+
+    adata_ref = _make_adata(
+        X=rng.normal(size=(len(ref_labels), 5)),
+        obs={
+            "celltype": ref_labels,
+            "batch": ["ref_a", "ref_b"] * (len(ref_labels) // 2),
+        },
+    )
+    adata_query = _make_adata(
+        X=rng.normal(size=(len(query_labels), 5)),
+        obs={
+            "celltype": query_labels,
+            "batch": ["query_a", "query_b"] * (len(query_labels) // 2) + ["query_a"] * (len(query_labels) % 2),
+        },
+    )
+
+    model = AdversarialBatchCorrector(
+        input_dim=5,
+        latent_dim=3,
+        n_bio_labels=3,
+        n_batches=2,
+        n_sources=None,
+    )
+    model.bio_encoder = LabelEncoder().fit(np.asarray(["A", "B", "C"]))
+
+    result = core.detect_domain_shift(
+        model=model,
+        adata_query=adata_query,
+        adata_reference=adata_ref,
+        bio_label="celltype",
+        device="cpu",
+        seed=0,
+    )
+
+    assert result["shared_cell_ratio"] == 1.0
+    assert result["shared_class_ratio"] == 1.0
+    assert result["min_shared_ref_cells"] == 6
+    assert result["min_shared_query_cells"] == 1
+    assert result["recommended_mode"] == "auto"
+
+
+def test_transform_query_adaptive_still_runs_probe_with_large_reference_class_counts(monkeypatch, capsys):
+    rng = np.random.default_rng(1)
     n_ref_classes = 120
     ref_labels = [f"class_{idx:03d}" for idx in range(n_ref_classes) for _ in range(2)]
-    query_labels = [f"class_{idx:03d}" for idx in range(5) for _ in range(3)] + ["orphan"] * 3
+    query_labels = [f"class_{idx:03d}" for idx in range(5) for _ in range(3)]
 
     adata_ref = _make_adata(
         X=rng.normal(size=(len(ref_labels), 5)),
@@ -146,6 +237,25 @@ def test_transform_query_adaptive_uses_analytical_path_for_large_reference_class
     )
     model.bio_encoder = LabelEncoder().fit(np.asarray(ref_labels))
 
+    called = {"probe": False}
+
+    def fake_detect_domain_shift(*args, **kwargs):
+        called["probe"] = True
+        return {
+            "needs_adapter": False,
+            "adapter_dim": 0,
+            "residual_magnitude": 0.05,
+            "residual_std": 0.01,
+            "confidence": "medium",
+            "recommended_mode": "auto",
+            "raw_domain_metric": "global mean offset",
+            "shared_cell_ratio": None,
+            "shared_class_ratio": None,
+            "shared_class_count": None,
+        }
+
+    monkeypatch.setattr(core, "detect_domain_shift", fake_detect_domain_shift)
+
     adata_out = core.transform_query_adaptive(
         model=model,
         adata_query=adata_query,
@@ -156,66 +266,9 @@ def test_transform_query_adaptive_uses_analytical_path_for_large_reference_class
     )
 
     captured = capsys.readouterr().out
-    assert "analytical mean-shift path" in captured
+    assert called["probe"] is True
+    assert "analytical" not in captured.lower()
     assert adata_out.obsm["X_ScAdver"].shape == (len(query_labels), 3)
-
-
-def test_transform_query_adaptive_can_apply_large_scale_refinement(monkeypatch):
-    rng = np.random.default_rng(7)
-    n_ref_classes = 120
-    ref_labels = [f"class_{idx:03d}" for idx in range(n_ref_classes) for _ in range(2)]
-    query_labels = [f"class_{idx:03d}" for idx in range(6) for _ in range(4)] + ["orphan"] * 4
-
-    adata_ref = _make_adata(
-        X=rng.normal(size=(len(ref_labels), 5)),
-        obs={
-            "celltype": ref_labels,
-            "batch": ["ref_a", "ref_b"] * n_ref_classes,
-        },
-    )
-    adata_query = _make_adata(
-        X=rng.normal(size=(len(query_labels), 5)),
-        obs={
-            "celltype": query_labels,
-            "batch": ["query_a", "query_b"] * (len(query_labels) // 2),
-        },
-    )
-
-    model = AdversarialBatchCorrector(
-        input_dim=5,
-        latent_dim=3,
-        n_bio_labels=n_ref_classes,
-        n_batches=2,
-        n_sources=None,
-    )
-    model.bio_encoder = LabelEncoder().fit(np.asarray(ref_labels))
-
-    called = {}
-
-    def fake_refinement(**kwargs):
-        called["refine_mask_sum"] = int(np.asarray(kwargs["refine_mask"]).sum())
-        analytical = kwargs["analytical_embeddings"]
-        return np.full_like(analytical, 7.5), {
-            "ran": True,
-            "refinable_classes": 6,
-            "train_cells": called["refine_mask_sum"],
-            "final_scale": 0.02,
-            "avg_delta": 0.03,
-        }
-
-    monkeypatch.setattr(core, "_run_large_scale_refinement", fake_refinement)
-
-    adata_out = core.transform_query_adaptive(
-        model=model,
-        adata_query=adata_query,
-        adata_reference=adata_ref,
-        bio_label="celltype",
-        device="cpu",
-        seed=0,
-    )
-
-    assert called["refine_mask_sum"] > 0
-    assert np.allclose(adata_out.obsm["X_ScAdver"], 7.5)
 
 
 def test_transform_query_adaptive_ignores_unmatched_cells_in_neural_bio_supervision(monkeypatch, capsys):
