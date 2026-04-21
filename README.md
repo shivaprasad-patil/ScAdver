@@ -2,7 +2,7 @@
 
 ScAdver eliminates technical batch effects from single-cell RNA-seq data while preserving biological variation and cell type identity. It follows a **train-once, project-forever** paradigm — train on reference data, then rapidly project unlimited query batches without retraining.
 
-![ScAdver Workflow](images/ScAdver_workflow_v2.png)
+![ScAdver Workflow](images/ScAdver_workflow.png)
 
 ## Key Features
 
