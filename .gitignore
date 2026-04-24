@@ -33,6 +33,9 @@ wheels/
 *.csv
 *.tsv
 
+# Local documentation
+SCADVER_TECHNICAL_REPORT.md
+
 # IDE
 .vscode/
 .idea/
