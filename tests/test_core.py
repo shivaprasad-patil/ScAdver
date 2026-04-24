@@ -331,6 +331,69 @@ def test_transform_query_adaptive_ignores_unmatched_cells_in_neural_bio_supervis
     assert adata_out.obsm["X_ScAdver"].shape == (len(query_labels), 4)
 
 
+def test_transform_query_adaptive_keeps_bio_supervision_with_partial_nan_labels(monkeypatch, capsys):
+    rng = np.random.default_rng(7)
+    ref_labels = ["acinar"] * 6 + ["beta"] * 6 + ["gamma"] * 6
+    query_labels = ["acinar"] * 2 + ["beta"] * 2 + [np.nan] * 16
+
+    adata_ref = _make_adata(
+        X=rng.normal(size=(len(ref_labels), 6)),
+        obs={
+            "celltype": ref_labels,
+            "batch": ["r0", "r1"] * (len(ref_labels) // 2),
+        },
+    )
+    adata_query = _make_adata(
+        X=rng.normal(size=(len(query_labels), 6)),
+        obs={
+            "celltype": query_labels,
+            "batch": ["q0", "q1"] * (len(query_labels) // 2),
+        },
+    )
+
+    model = AdversarialBatchCorrector(
+        input_dim=6,
+        latent_dim=4,
+        n_bio_labels=3,
+        n_batches=2,
+        n_sources=None,
+    )
+    model.bio_encoder = LabelEncoder().fit(np.asarray(["acinar", "beta", "gamma"]))
+
+    monkeypatch.setattr(
+        core,
+        "detect_domain_shift",
+        lambda *args, **kwargs: {
+            "needs_adapter": True,
+            "adapter_dim": 128,
+            "residual_magnitude": 0.2,
+            "residual_std": 0.0,
+            "confidence": "high",
+        },
+    )
+
+    adata_out = core.transform_query_adaptive(
+        model=model,
+        adata_query=adata_query,
+        adata_reference=adata_ref,
+        bio_label="celltype",
+        adaptation_epochs=1,
+        max_epochs=1,
+        warmup_epochs=0,
+        patience=1,
+        learning_rate=0.0005,
+        device="cpu",
+        seed=0,
+    )
+
+    captured = capsys.readouterr().out
+    assert "labeled cells matched: 100.0%" in captured
+    assert "Bio supervision ENABLED" in captured
+    assert "Bio supervision DISABLED" not in captured
+    assert "ignoring 16 unmatched cells" in captured
+    assert adata_out.obsm["X_ScAdver"].shape == (len(query_labels), 4)
+
+
 def test_get_domain_mixing_labels_uses_reference_query_roles():
     adata_ref = _make_adata(
         X=np.zeros((4, 2)),

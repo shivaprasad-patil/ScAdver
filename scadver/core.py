@@ -1313,19 +1313,34 @@ def transform_query_adaptive(
         print(f"   Query classes  : {n_query_classes}")
         print(f"   Ref classifier : {ref_n_classes} output classes")
         if label_stats is not None:
+            # Evaluate overlap only over cells that actually carry a label.
+            # NaN obs values become the string 'nan' via .astype(str) and are
+            # always unmatched — including them deflates the ratio for datasets
+            # with intentional partial labeling.
+            _non_nan_mask = np.array([str(l) != 'nan' for l in query_ct_raw])
+            _labeled_matched_ratio = (
+                float(label_stats['matched_mask'][_non_nan_mask].mean())
+                if _non_nan_mask.any()
+                else 0.0
+            )
             print(
                 f"   Shared classes : {len(label_stats['matched_classes'])}/"
                 f"{len(label_stats['total_classes'])}"
             )
             print(f"   Shared cells   : {label_stats['matched_cell_ratio']:.1%}")
-            print(f"   Overlap ratio  : {label_stats['matched_class_ratio']:.1%}")
+            print(
+                "   Overlap ratio  : "
+                f"{label_stats['matched_class_ratio']:.1%}  "
+                f"(labeled cells matched: {_labeled_matched_ratio:.1%})"
+            )
         else:
             print("   Overlap ratio  : 0.0%")
+            _labeled_matched_ratio = 0.0
 
         if (
             label_stats is None
             or label_stats['matched_class_ratio'] < 0.3
-            or label_stats['matched_cell_ratio'] < 0.3
+            or _labeled_matched_ratio < 0.3
         ):
             print("     Bio supervision DISABLED — exact label overlap too low (<30%)")
         elif n_query_classes > 100:
